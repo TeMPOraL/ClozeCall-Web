@@ -1,0 +1,61 @@
+/* Cloze Call V2 (NG) — responsive canvas layout. */
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: #000;
+  color: #ccc;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  height: 100%;
+  overflow: hidden;
+  /* Kill iOS rubber-banding so drags on the canvas don't scroll the page. */
+  overscroll-behavior: none;
+}
+
+body {
+  /* Center the wrap in the viewport, letterbox with black. */
+  display: grid;
+  place-items: center;
+  width: 100vw;
+  height: 100vh;
+  /* Respect iOS safe areas so the canvas doesn't slip under the notch. */
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  box-sizing: border-box;
+}
+
+#wrap {
+  /* Scale the 800x600 design resolution to the largest 4:3 rectangle that
+     fits the viewport. The canvas itself keeps its intrinsic 800x600 — all
+     world coordinates stay in design pixels; only CSS scales the surface. */
+  width: min(100vw, calc(100vh * 4 / 3));
+  height: min(100vh, calc(100vw * 3 / 4));
+  position: relative;
+}
+
+#game {
+  display: block;
+  width: 100%;
+  height: 100%;
+  background: #000;
+  cursor: crosshair;
+  /* Critical for mobile: stop the browser from hijacking pointer drags for
+     scroll/zoom/pinch. Without this, dragging on a touchscreen does nothing. */
+  touch-action: none;
+  /* Stop iOS from auto-selecting text or showing a magnifier on long-press. */
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  /* Pixel art looks fine under browser-default filtering at our scale. */
+  image-rendering: auto;
+}
+
+#status {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  font-size: 20px;
+  letter-spacing: 0.1em;
+}
