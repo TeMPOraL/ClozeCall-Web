@@ -1,6 +1,7 @@
 // Cloze Call V2 — main game state.
 // design-v2.md §1..§13 all converge here. Includes:
 //   - 60 Hz fixed-timestep physics (via FIXED_DT_SECONDS),
+//   - dynamic camera (§3.3) with viewport-filling canvas,
 //   - mass-weighted centroid for escape-velocity (§6),
 //   - forward-integrated aim preview (§5),
 //   - unified 400 px launch cap (§5.3),
@@ -8,15 +9,17 @@
 //   - HUD integration (§8) with clickable mute button,
 //   - synthesized sfx at key transitions (§13),
 //   - ESC confirmation sub-state (§9.4 / §19 answer #4),
-//   - streak-driven level generation (§11, delegated to levels.js).
+//   - streak-driven level generation (§11, delegated to levels.js),
+//   - shot forfeit (§9.5),
+//   - level retry on defeat (§9.4, §10.3).
 
 import { GameState } from './gsm.js';
 import {
-  SCREEN_WIDTH, SCREEN_HEIGHT,
   G, LAUNCH_SPEED_CAP, FORCE_INDICATOR_1_OVER_MAX,
   OFFWORLD_MAX_DISTANCE_FROM_ORIGIN,
   MARKER_DISTANCE_TO_SCREEN_BORDER,
   MARKER_ROTATION_OFFSET,
+  FORFEIT_GRACE_SECONDS, FORFEIT_HINT_DELAY_SECONDS,
 } from './config.js';
 import {
   makeVec, addVecs, subVecs, negativeVec, scaledVec, normalizedVec,
@@ -29,13 +32,18 @@ import {
 } from './levels.js';
 import {
   pointerPosition, pointerPressed, pointerHovering,
-  consumePointerReleased, resetPointerState,
+  consumePointerReleased, resetPointerState, setCoordinateTransform,
 } from './input.js';
 import * as session from './session.js';
 import * as audio from './audio.js';
 import * as rng from './rng.js';
 import { computeAimPreview, drawAimPreview } from './aim-preview.js';
 import { renderHud, hudMuteContains } from './hud.js';
+import {
+  createCamera, cameraResetToAiming, cameraUpdateTarget,
+  cameraUpdate, cameraApplyTransform, cameraInverseTransform,
+  cameraVisibleRect,
+} from './camera.js';
 
 // Color endpoints for the aim line lerp.
 const GREEN = { r: 0,   g: 255, b: 0 };
@@ -48,15 +56,12 @@ const lerpColor = (a, b, t) => ({
 
 // ---- Physics helpers ----
 
-// Euler integrator: velocity += force * dt / mass, position += velocity * dt.
 const applyForce = (ball, force, dt) => {
   const accel = scaledVec(force, dt / ball.mass);
   ball.velocity = addVecs(ball.velocity, accel);
   ball.position = addVecs(ball.position, scaledVec(ball.velocity, dt));
 };
 
-// Sum of (normalize(ball - body) * body.mass / dist^2) over all bodies.
-// Multiplied by G (negative) later to flip into an attractive force.
 const computeGravityField = (bodies, ball) => {
   let total = makeVec(0, 0);
   for (const body of bodies) {
@@ -75,8 +80,6 @@ const collisionBetweenObjects = (a, b) =>
 const anyCollision = (bodies, ball) =>
   bodies.some(b => collisionBetweenObjects(b, ball));
 
-// design-v2.md §6: mass-weighted centroid, not the unweighted average v1 had.
-// The total M_total in the escape-velocity numerator is unchanged.
 const escapeVelocity = (bodies, ballPosition) => {
   if (bodies.length === 0) return 0;
   let sumX = 0, sumY = 0, totalMass = 0;
@@ -95,8 +98,6 @@ const offworldP = (bodies, ball) => {
   return vecMag(ball.velocity) > escapeVelocity(bodies, ball.position);
 };
 
-// Launch velocity: direction = (pointer - ball), magnitude = distance capped
-// at LAUNCH_SPEED_CAP (unconditional; no flag in v2).
 const computeVelocityFromPositionAndPointer = (position, pointer) => {
   const delta = [pointer[0] - position[0], pointer[1] - position[1]];
   const d = vecMag(delta);
@@ -108,33 +109,19 @@ const computeVelocityFromPositionAndPointer = (position, pointer) => {
 const computeForceIndicator = (position, pointer) =>
   clamp(distance(position, pointer) * FORCE_INDICATOR_1_OVER_MAX, 0, 1);
 
-const offscreenP = p =>
-  p[0] > SCREEN_WIDTH || p[1] > SCREEN_HEIGHT || p[0] < 0 || p[1] < 0;
+// ---- Confirm-exit dialog geometry (canvas-pixel space) ----
 
-// Clamp p into a rectangle inset by MARKER_DISTANCE_TO_SCREEN_BORDER.
-// Used as the anchor for the edge-arrow sprite.
-const computeEdgeAnchor = p => [
-  clamp(p[0], MARKER_DISTANCE_TO_SCREEN_BORDER, SCREEN_WIDTH  - MARKER_DISTANCE_TO_SCREEN_BORDER),
-  clamp(p[1], MARKER_DISTANCE_TO_SCREEN_BORDER, SCREEN_HEIGHT - MARKER_DISTANCE_TO_SCREEN_BORDER),
-];
-
-// Same quirky "absolute difference from clamped position" used by v1 for
-// the circle arc radius. design-v2.md §7 keeps the arc unchanged.
-const computeOffscreenArcPoint = p => [
-  Math.abs(clamp(p[0], 0, SCREEN_WIDTH)  - MARKER_DISTANCE_TO_SCREEN_BORDER),
-  Math.abs(clamp(p[1], 0, SCREEN_HEIGHT) - MARKER_DISTANCE_TO_SCREEN_BORDER),
-];
-
-// ---- ESC confirm dialog geometry ----
-
-const CONFIRM_BOX = {
-  x: SCREEN_WIDTH / 2 - 180,
-  y: SCREEN_HEIGHT / 2 - 80,
-  w: 360,
-  h: 160,
+const confirmLayout = (canvasW, canvasH) => {
+  const bw = 360, bh = 160;
+  const bx = canvasW / 2 - bw / 2;
+  const by = canvasH / 2 - bh / 2;
+  return {
+    box: { x: bx, y: by, w: bw, h: bh },
+    yes: { x: bx + 20,  y: by + 100, w: 120, h: 40 },
+    no:  { x: bx + 220, y: by + 100, w: 120, h: 40 },
+  };
 };
-const CONFIRM_YES = { x: SCREEN_WIDTH / 2 - 140, y: SCREEN_HEIGHT / 2 + 10, w: 120, h: 40 };
-const CONFIRM_NO  = { x: SCREEN_WIDTH / 2 +  20, y: SCREEN_HEIGHT / 2 + 10, w: 120, h: 40 };
+
 const pointInRect = (px, py, r) =>
   px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h;
 
@@ -149,31 +136,50 @@ export class MainGameState extends GameState {
     this.backgroundImage = null;
     this.markerImage = null;
     this.state = 'aiming'; // aiming | simulation | confirm-exit
-    // `resumeSub` records what we were doing when the ESC dialog opened, so
-    // a NO response returns exactly where we were.
     this.resumeSub = 'aiming';
+    this.cam = createCamera();
+    this.simTime = 0;  // seconds elapsed since launch (for forfeit grace)
   }
 
   initializeState(gsm) {
-    // Record the seed at the start of this level for the future share button.
-    session.startLevel(rng.currentState());
+    // Check for a retry request first (design-v2.md §9.4, §10.3).
+    const retry = session.consumeRetry();
+    if (retry) {
+      rng.seed(retry.seed);
+      loadLevel('ng', retry.streak);
+      this.celestialBodies = levelGetCelestialBodies(retry.streak);
+    } else {
+      session.startLevel(rng.currentState());
+      loadLevel('ng', session.getStreak());
+      this.celestialBodies = levelGetCelestialBodies(session.getStreak());
+    }
 
-    loadLevel('ng', session.getStreak());
-    this.celestialBodies = levelGetCelestialBodies(session.getStreak());
     this.backgroundImage = loadImage(levelGetBackgroundImageName());
     this.markerImage = loadImage('marker.png');
     this.state = 'aiming';
     this.resumeSub = 'aiming';
     this.ball = levelGetBall();
     this.hole = levelGetHole();
-    // Drop any lingering press from the previous state.
+    this.simTime = 0;
+
+    // Reset camera to aiming default.
+    cameraResetToAiming(this.cam);
+
+    // Set coordinate transform so pointer positions arrive in world coords.
+    const cam = this.cam;
+    const canvas = gsm.canvas;
+    setCoordinateTransform((cx, cy) =>
+      cameraInverseTransform(cam, canvas.width, canvas.height, cx, cy)
+    );
+
     resetPointerState();
   }
 
-  // Reset just the ball after a crash. Same planets/hole. Mirrors v1.
   reinitializeGame() {
     this.state = 'aiming';
     this.ball = levelGetBall();
+    this.simTime = 0;
+    cameraResetToAiming(this.cam);
     resetPointerState();
   }
 
@@ -185,55 +191,88 @@ export class MainGameState extends GameState {
     }
   }
 
-  render(ctx, _gsm) {
-    // render-common
+  render(ctx, gsm) {
+    const cw = ctx.canvas.width;
+    const ch = ctx.canvas.height;
+
+    // 1. Clear entire canvas.
     ctx.fillStyle = 'black';
-    ctx.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
-    drawImage(ctx, this.backgroundImage);
+    ctx.fillRect(0, 0, cw, ch);
+
+    // 2. Background (screen space, before camera transform).
+    // "Cover" mode: scale to fill the canvas, crop overflow. No tiling seams.
+    const bg = this.backgroundImage;
+    if (bg && bg.complete) {
+      const iw = bg.naturalWidth || bg.width;
+      const ih = bg.naturalHeight || bg.height;
+      if (iw && ih) {
+        const scale = Math.max(cw / iw, ch / ih);
+        const dw = iw * scale, dh = ih * scale;
+        ctx.drawImage(bg, (cw - dw) / 2, (ch - dh) / 2, dw, dh);
+      }
+    }
+
+    // 3. Apply camera transform.
+    ctx.save();
+    cameraApplyTransform(ctx, this.cam, cw, ch);
+
+    // 4-6. World objects.
     for (const b of this.celestialBodies) b.draw(ctx);
     this.hole.draw(ctx);
     this.ball.draw(ctx);
 
-    // Aim overlay (only in aiming).
+    // 7. Aim overlay (aiming only).
     if (this.state === 'aiming') this.renderAiming(ctx);
-    // Off-screen marker (only while the ball is in flight).
-    if (this.state === 'simulation') this.renderSimulation(ctx);
 
-    // HUD on top of gameplay.
+    // 8. Off-screen indicators (simulation only).
+    if (this.state === 'simulation') this.renderSimulation(ctx, cw, ch);
+
+    // 9. End camera transform.
+    ctx.restore();
+
+    // 10. HUD (screen space).
     renderHud(ctx, {
       lives:  session.getLives(),
       streak: session.getStreak(),
       best:   session.getBest(),
     });
 
-    // Confirm overlay goes on top of HUD (it's the modal).
+    // Forfeit hint (screen space, design-v2.md §9.5).
+    if (this.state === 'simulation' && this.simTime >= FORFEIT_HINT_DELAY_SECONDS) {
+      ctx.font = '14px ui-monospace, Menlo, Consolas, monospace';
+      ctx.fillStyle = 'rgba(255,255,255,0.45)';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'bottom';
+      ctx.fillText('tap to forfeit shot', cw / 2, ch - 14);
+    }
+
+    // 11. Confirm overlay (screen space).
     if (this.state === 'confirm-exit') this.renderConfirmExit(ctx);
   }
 
   // ---- sub-state: aiming ----
   updateAiming(gsm, _dt) {
-    const releasePt = consumePointerReleased();
-    if (!releasePt) return;
+    const release = consumePointerReleased();
+    if (!release) return;
 
-    // HUD mute button: swallow the tap and toggle audio.
-    if (hudMuteContains(releasePt[0], releasePt[1])) {
+    // HUD mute button: hit-test in canvas-pixel coords.
+    if (hudMuteContains(release.raw[0], release.raw[1], gsm.canvas.width)) {
       audio.toggleMute();
       audio.sfxMenuClick();
       return;
     }
 
-    this.ball.velocity = computeVelocityFromPositionAndPointer(this.ball.position, releasePt);
+    this.ball.velocity = computeVelocityFromPositionAndPointer(this.ball.position, release.pos);
     audio.sfxLaunch();
     this.state = 'simulation';
     this.resumeSub = 'simulation';
+    this.simTime = 0;
   }
 
   renderAiming(ctx) {
-    // design-v2.md §4.2 visibility rule: draw aim overlay when hovering or pressed.
     if (!(pointerHovering() || pointerPressed())) return;
     const p = pointerPosition();
 
-    // Aim preview polyline (forward-integrated trajectory).
     const previewVelocity = computeVelocityFromPositionAndPointer(this.ball.position, p);
     const preview = computeAimPreview({
       startPosition: this.ball.position,
@@ -244,7 +283,6 @@ export class MainGameState extends GameState {
     });
     drawAimPreview(ctx, preview);
 
-    // Straight aim line, green->red lerp by launch-power.
     const t = computeForceIndicator(this.ball.position, p);
     const col = lerpColor(GREEN, RED, t);
     ctx.strokeStyle = `rgb(${col.r}, ${col.g}, ${col.b})`;
@@ -258,17 +296,30 @@ export class MainGameState extends GameState {
 
   // ---- sub-state: simulation ----
   updateSimulation(gsm, dt) {
+    this.simTime += dt;
+
     const field = computeGravityField(this.celestialBodies, this.ball);
     applyForce(this.ball, scaledVec(field, G), dt);
 
-    // Allow a HUD mute-button tap even while the ball is in flight.
-    const releasePt = consumePointerReleased();
-    if (releasePt && hudMuteContains(releasePt[0], releasePt[1])) {
-      audio.toggleMute();
-      audio.sfxMenuClick();
+    // Camera: track all objects during simulation.
+    cameraUpdateTarget(this.cam, this.ball, this.celestialBodies, this.hole,
+      gsm.canvas.width, gsm.canvas.height);
+    cameraUpdate(this.cam);
+
+    // Pointer tap: mute button or forfeit (after grace period).
+    const release = consumePointerReleased();
+    if (release) {
+      if (hudMuteContains(release.raw[0], release.raw[1], gsm.canvas.width)) {
+        audio.toggleMute();
+        audio.sfxMenuClick();
+      } else if (this.simTime >= FORFEIT_GRACE_SECONDS) {
+        audio.sfxForfeit();
+        this.handleLifeLoss(gsm);
+        return;
+      }
     }
 
-    // Outcome detection. Sequential checks — hole > off-world > planet priority.
+    // Outcome detection: hole > off-world > planet priority.
     let outcome = null;
     if (anyCollision(this.celestialBodies, this.ball)) outcome = 'planet';
     if (offworldP(this.celestialBodies, this.ball))    outcome = 'offworld';
@@ -286,13 +337,26 @@ export class MainGameState extends GameState {
     }
   }
 
-  renderSimulation(ctx) {
+  renderSimulation(ctx, canvasW, canvasH) {
     const p = this.ball.position;
-    if (!offscreenP(p)) return;
 
-    // Circle arc (v1 behavior kept).
-    const arcAnchor = computeOffscreenArcPoint(p);
-    const delta = addVecs(negativeVec(p), arcAnchor);
+    // Off-screen detection uses the camera's visible world rect, not the
+    // fixed 800×600 design viewport (design-v2.md §7.2).
+    const vis = cameraVisibleRect(this.cam, canvasW, canvasH);
+    const offscreen = p[0] < vis.x || p[0] > vis.x + vis.w ||
+                      p[1] < vis.y || p[1] > vis.y + vis.h;
+    if (!offscreen) return;
+
+    // Circle arc (world space — drawn inside camera transform).
+    const edgeX = clamp(p[0], vis.x + MARKER_DISTANCE_TO_SCREEN_BORDER,
+                               vis.x + vis.w - MARKER_DISTANCE_TO_SCREEN_BORDER);
+    const edgeY = clamp(p[1], vis.y + MARKER_DISTANCE_TO_SCREEN_BORDER,
+                               vis.y + vis.h - MARKER_DISTANCE_TO_SCREEN_BORDER);
+    const arcPt = [
+      Math.abs(clamp(p[0], vis.x, vis.x + vis.w) - (vis.x + MARKER_DISTANCE_TO_SCREEN_BORDER)),
+      Math.abs(clamp(p[1], vis.y, vis.y + vis.h) - (vis.y + MARKER_DISTANCE_TO_SCREEN_BORDER)),
+    ];
+    const delta = addVecs(negativeVec(p), arcPt);
     const r = Math.round(vecMag(delta));
     ctx.strokeStyle = 'rgba(0, 255, 0, 0.8)';
     ctx.lineWidth = 2;
@@ -301,9 +365,8 @@ export class MainGameState extends GameState {
     ctx.arc(Math.round(p[0]), Math.round(p[1]), r, 0, Math.PI * 2);
     ctx.stroke();
 
-    // Edge arrow (new in v2, §7): marker.png rotated to point toward the
-    // off-screen ball.
-    const anchor = computeEdgeAnchor(p);
+    // Edge arrow: marker.png rotated to point toward the ball.
+    const anchor = [edgeX, edgeY];
     const angle = Math.atan2(p[1] - anchor[1], p[0] - anchor[0]) + MARKER_ROTATION_OFFSET;
     ctx.save();
     ctx.translate(anchor[0], anchor[1]);
@@ -314,7 +377,7 @@ export class MainGameState extends GameState {
     ctx.restore();
   }
 
-  // ---- life-loss path shared by planet-collision and off-world ----
+  // ---- life-loss path shared by planet-collision, off-world, and forfeit ----
   handleLifeLoss(gsm) {
     const runOver = session.loseLife();
     if (runOver) {
@@ -326,37 +389,44 @@ export class MainGameState extends GameState {
 
   // ---- sub-state: confirm-exit ----
   updateConfirmExit(gsm) {
-    const releasePt = consumePointerReleased();
-    if (!releasePt) return;
-    if (pointInRect(releasePt[0], releasePt[1], CONFIRM_YES)) {
+    const release = consumePointerReleased();
+    if (!release) return;
+    const layout = confirmLayout(gsm.canvas.width, gsm.canvas.height);
+    if (pointInRect(release.raw[0], release.raw[1], layout.yes)) {
       this.exitToMenu(gsm);
-    } else if (pointInRect(releasePt[0], releasePt[1], CONFIRM_NO)) {
+    } else if (pointInRect(release.raw[0], release.raw[1], layout.no)) {
       this.resumeFromConfirm();
     }
   }
 
   renderConfirmExit(ctx) {
+    const cw = ctx.canvas.width;
+    const ch = ctx.canvas.height;
+
     // Dim the gameplay layer.
     ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
-    ctx.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+    ctx.fillRect(0, 0, cw, ch);
 
-    // Dialog box
+    const layout = confirmLayout(cw, ch);
+    const { box } = layout;
+
+    // Dialog box.
     ctx.fillStyle = 'rgba(20, 20, 30, 0.95)';
-    ctx.fillRect(CONFIRM_BOX.x, CONFIRM_BOX.y, CONFIRM_BOX.w, CONFIRM_BOX.h);
+    ctx.fillRect(box.x, box.y, box.w, box.h);
     ctx.strokeStyle = 'rgba(255, 255, 255, 0.6)';
     ctx.lineWidth = 2;
     ctx.setLineDash([]);
-    ctx.strokeRect(CONFIRM_BOX.x, CONFIRM_BOX.y, CONFIRM_BOX.w, CONFIRM_BOX.h);
+    ctx.strokeRect(box.x, box.y, box.w, box.h);
 
-    // Title
+    // Title.
     ctx.font = '20px ui-monospace, Menlo, Consolas, monospace';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillStyle = 'rgba(255, 255, 255, 0.95)';
-    ctx.fillText('Return to main menu?', SCREEN_WIDTH / 2, CONFIRM_BOX.y + 40);
+    ctx.fillText('Return to main menu?', cw / 2, box.y + 40);
     ctx.font = '13px ui-monospace, Menlo, Consolas, monospace';
     ctx.fillStyle = 'rgba(255, 255, 255, 0.55)';
-    ctx.fillText('Your current streak will be lost.', SCREEN_WIDTH / 2, CONFIRM_BOX.y + 64);
+    ctx.fillText('Your current streak will be lost.', cw / 2, box.y + 64);
 
     const drawButton = (rect, label, accent) => {
       ctx.fillStyle = accent ? 'rgba(200, 40, 40, 0.9)' : 'rgba(60, 80, 120, 0.9)';
@@ -369,11 +439,11 @@ export class MainGameState extends GameState {
       ctx.textBaseline = 'middle';
       ctx.fillText(label, rect.x + rect.w / 2, rect.y + rect.h / 2);
     };
-    drawButton(CONFIRM_YES, 'YES (Y)', true);
-    drawButton(CONFIRM_NO,  'NO  (N)', false);
+    drawButton(layout.yes, 'YES (Y)', true);
+    drawButton(layout.no,  'NO  (N)', false);
   }
 
-  // ---- state-manager key hook (ESC / Y / N / M) ----
+  // ---- state-manager key hook (ESC / Y / N / M / R) ----
   onKey(gsm, key) {
     if (this.state === 'confirm-exit') {
       if (key === 'KeyY') {
@@ -388,17 +458,26 @@ export class MainGameState extends GameState {
     } else if (key === 'KeyM') {
       audio.toggleMute();
       audio.sfxMenuClick();
+    } else if (key === 'KeyR' && this.state === 'simulation') {
+      // Shot forfeit via keyboard (design-v2.md §9.5).
+      if (this.simTime >= FORFEIT_GRACE_SECONDS) {
+        audio.sfxForfeit();
+        this.handleLifeLoss(gsm);
+      }
     }
   }
 
-  // Space/Enter during aiming/simulation is deliberately a no-op.
-  onSkip(_gsm) { /* intentionally empty */ }
+  // Space/Enter during simulation acts as forfeit after grace period.
+  onSkip(gsm) {
+    if (this.state === 'simulation' && this.simTime >= FORFEIT_GRACE_SECONDS) {
+      audio.sfxForfeit();
+      this.handleLifeLoss(gsm);
+    }
+  }
 
   enterConfirmExit() {
-    this.resumeSub = this.state; // 'aiming' or 'simulation'
+    this.resumeSub = this.state;
     this.state = 'confirm-exit';
-    // Clear any in-flight pointer so the same gesture that opened this dialog
-    // (e.g. the Esc-key release) doesn't auto-click YES or NO.
     consumePointerReleased();
     resetPointerState();
   }

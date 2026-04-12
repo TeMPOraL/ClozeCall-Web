@@ -83,6 +83,15 @@ export const MARKER_SIZE = [20, 20];
 // some other direction. Adjust during wiring-up.
 export const MARKER_ROTATION_OFFSET = 0;
 
+// ---- Camera (design-v2.md §3.3) ----
+export const CAMERA_LERP_SPEED = 0.05;
+export const CAMERA_PADDING = 100;       // world-units of margin around bounding box
+export const CAMERA_ZOOM_FLOOR = 0.15;   // minimum zoom (max zoom-out)
+
+// ---- Shot forfeit (design-v2.md §9.5) ----
+export const FORFEIT_GRACE_SECONDS = 0.5;
+export const FORFEIT_HINT_DELAY_SECONDS = 2.0;
+
 // ---- Lives ----
 export const LIVES_PER_LEVEL = 3;
 

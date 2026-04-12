@@ -4,21 +4,39 @@
 import { GameState } from './gsm.js';
 import { loadImage, drawImage } from './pictures.js';
 import { SCREEN_WIDTH, SCREEN_HEIGHT, LS_SEEN_INTRO } from './config.js';
-import { consumePointerReleased, pointerPosition, pointerHovering, pointerPressed, resetPointerState } from './input.js';
+import { consumePointerReleased, pointerPosition, pointerHovering, pointerPressed, resetPointerState, setCoordinateTransform } from './input.js';
 import * as session from './session.js';
 import * as audio from './audio.js';
+
+// Inverse of the uniform-scaling transform used to render 800×600 design
+// content centered on an arbitrarily-sized canvas.
+const makeDesignTransform = (canvas) => (canvasX, canvasY) => {
+  const cw = canvas.width, ch = canvas.height;
+  const s = Math.min(cw / 800, ch / 600);
+  return [(canvasX - (cw - 800 * s) / 2) / s, (canvasY - (ch - 600 * s) / 2) / s];
+};
 
 const pointInRect = (px, py, r) =>
   px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h;
 
-// Shared helpers: draw a full-screen background (black + intro1.png) and a
-// translucent vignette underlay so overlay text pops against the artwork.
+// Draw a cover-scaled background across the full canvas with a translucent
+// vignette. Called BEFORE the uniform-scaling ctx.save/translate/scale so it
+// covers the entire viewport including non-4:3 margins.
 const drawMenuBackground = (ctx, background) => {
+  const cw = ctx.canvas.width, ch = ctx.canvas.height;
   ctx.fillStyle = 'black';
-  ctx.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
-  drawImage(ctx, background);
+  ctx.fillRect(0, 0, cw, ch);
+  if (background && background.complete) {
+    const iw = background.naturalWidth || background.width;
+    const ih = background.naturalHeight || background.height;
+    if (iw && ih) {
+      const scale = Math.max(cw / iw, ch / ih);
+      const dw = iw * scale, dh = ih * scale;
+      ctx.drawImage(background, (cw - dw) / 2, (ch - dh) / 2, dw, dh);
+    }
+  }
   ctx.fillStyle = 'rgba(0, 0, 0, 0.45)';
-  ctx.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+  ctx.fillRect(0, 0, cw, ch);
 };
 
 const drawCenteredText = (ctx, text, x, y, { size = 24, weight = 'normal', color = 'white', align = 'center' } = {}) => {
@@ -53,9 +71,10 @@ export class MainMenuState extends GameState {
     this.prevHoverIdx = -1;
   }
 
-  initializeState(_gsm) {
+  initializeState(gsm) {
     this.background = loadImage('intro1.png');
     this.buttons = this.computeButtons();
+    setCoordinateTransform(makeDesignTransform(gsm.canvas));
     resetPointerState();
   }
 
@@ -83,9 +102,9 @@ export class MainMenuState extends GameState {
     }
     this.hoverIdx = newHover;
 
-    const releasePt = consumePointerReleased();
-    if (releasePt) {
-      const btn = this.buttons.find(b => pointInRect(releasePt[0], releasePt[1], b));
+    const release = consumePointerReleased();
+    if (release) {
+      const btn = this.buttons.find(b => pointInRect(release.pos[0], release.pos[1], b));
       if (btn) {
         audio.sfxMenuClick();
         this.activateButton(gsm, btn.id);
@@ -128,11 +147,17 @@ export class MainMenuState extends GameState {
   }
 
   render(ctx, _gsm) {
+    // Full-canvas background (screen space, before scaling).
     drawMenuBackground(ctx, this.background);
 
-    // Title. We reuse intro1.png so there's already "Cloze Call" artwork on
-    // screen, but overlay our own prominent title so it reads clearly at any
-    // viewport size. design-v2.md §19 answer #1: reuse, don't author.
+    // Uniform scaling: center 800×600 design space on the canvas.
+    ctx.save();
+    const cw = ctx.canvas.width, ch = ctx.canvas.height;
+    const s = Math.min(cw / 800, ch / 600);
+    ctx.translate((cw - 800 * s) / 2, (ch - 600 * s) / 2);
+    ctx.scale(s, s);
+
+    // Title.
     drawCenteredText(ctx, 'CLOZE CALL', SCREEN_WIDTH / 2, 120, { size: 54, color: 'rgba(255,255,255,0.95)' });
     drawCenteredText(ctx, 'v2 (ng)',     SCREEN_WIDTH / 2, 160, { size: 16, color: 'rgba(255,255,255,0.5)' });
 
@@ -148,6 +173,8 @@ export class MainMenuState extends GameState {
     }
     drawCenteredText(ctx, 'mouse · touch · keyboard supported',
       SCREEN_WIDTH / 2, SCREEN_HEIGHT - 22, { size: 12, color: 'rgba(255,255,255,0.45)' });
+
+    ctx.restore();
   }
 }
 
@@ -167,8 +194,9 @@ const HOW_TO_LINES = [
 ];
 
 export class HowToPlayState extends GameState {
-  initializeState(_gsm) {
+  initializeState(gsm) {
     this.background = loadImage('intro1.png');
+    setCoordinateTransform(makeDesignTransform(gsm.canvas));
     resetPointerState();
   }
 
@@ -193,6 +221,13 @@ export class HowToPlayState extends GameState {
 
   render(ctx, _gsm) {
     drawMenuBackground(ctx, this.background);
+
+    ctx.save();
+    const cw = ctx.canvas.width, ch = ctx.canvas.height;
+    const s = Math.min(cw / 800, ch / 600);
+    ctx.translate((cw - 800 * s) / 2, (ch - 600 * s) / 2);
+    ctx.scale(s, s);
+
     drawCenteredText(ctx, 'HOW TO PLAY', SCREEN_WIDTH / 2, 90, { size: 40 });
 
     ctx.font = '18px ui-monospace, Menlo, Consolas, monospace';
@@ -208,6 +243,7 @@ export class HowToPlayState extends GameState {
 
     drawCenteredText(ctx, 'tap / space / esc — back', SCREEN_WIDTH / 2, SCREEN_HEIGHT - 30,
       { size: 14, color: 'rgba(255, 255, 255, 0.55)' });
+    ctx.restore();
   }
 }
 
@@ -227,8 +263,9 @@ const ABOUT_LINES = [
 ];
 
 export class AboutState extends GameState {
-  initializeState(_gsm) {
+  initializeState(gsm) {
     this.background = loadImage('intro1.png');
+    setCoordinateTransform(makeDesignTransform(gsm.canvas));
     resetPointerState();
   }
 
@@ -253,6 +290,13 @@ export class AboutState extends GameState {
 
   render(ctx, _gsm) {
     drawMenuBackground(ctx, this.background);
+
+    ctx.save();
+    const cw = ctx.canvas.width, ch = ctx.canvas.height;
+    const s = Math.min(cw / 800, ch / 600);
+    ctx.translate((cw - 800 * s) / 2, (ch - 600 * s) / 2);
+    ctx.scale(s, s);
+
     drawCenteredText(ctx, 'ABOUT', SCREEN_WIDTH / 2, 90, { size: 40 });
 
     ctx.font = '16px ui-monospace, Menlo, Consolas, monospace';
@@ -267,5 +311,6 @@ export class AboutState extends GameState {
 
     drawCenteredText(ctx, 'tap / space / esc — back', SCREEN_WIDTH / 2, SCREEN_HEIGHT - 30,
       { size: 14, color: 'rgba(255, 255, 255, 0.55)' });
+    ctx.restore();
   }
 }

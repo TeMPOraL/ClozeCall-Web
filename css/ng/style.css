@@ -13,23 +13,16 @@ html, body {
 }
 
 body {
-  /* Center the wrap in the viewport, letterbox with black. */
-  display: grid;
-  place-items: center;
-  width: 100vw;
-  height: 100vh;
   /* Respect iOS safe areas so the canvas doesn't slip under the notch. */
   padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
   box-sizing: border-box;
 }
 
 #wrap {
-  /* Scale the 800x600 design resolution to the largest 4:3 rectangle that
-     fits the viewport. The canvas itself keeps its intrinsic 800x600 — all
-     world coordinates stay in design pixels; only CSS scales the surface. */
-  width: min(100vw, calc(100vh * 4 / 3));
-  height: min(100vh, calc(100vw * 3 / 4));
-  position: relative;
+  /* Viewport-filling: no aspect-ratio constraint, no letterboxing.
+     design-v2.md §3.2. Canvas resolution tracks viewport via JS resize. */
+  position: fixed;
+  inset: 0;
 }
 
 #game {

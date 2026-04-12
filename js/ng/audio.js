@@ -173,3 +173,7 @@ export const sfxMenuClick = () => {
 export const sfxOffworld = () => {
   sweep({ fromFreq: 600, toFreq: 120, duration: 0.30, type: 'sawtooth', gain: 0.5 });
 };
+
+export const sfxForfeit = () => {
+  sweep({ fromFreq: 500, toFreq: 150, duration: 0.20, type: 'triangle', gain: 0.6 });
+};

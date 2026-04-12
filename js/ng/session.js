@@ -15,6 +15,10 @@ const session = {
   // Seed captured at the start of the current level — used by the future
   // share-this-level button. Stored as a raw uint32.
   currentLevelSeed: 0,
+  // Retry state (design-v2.md §10.3): in-memory only, survives endRun().
+  lastLevelSeed: 0,
+  lastLevelStreak: 0,
+  retryPending: false,
 };
 
 // ---- Best-streak persistence ----
@@ -41,11 +45,15 @@ export const getLives  = () => session.lives;
 export const getStreak = () => session.streak;
 export const getBest   = () => session.best;
 export const getCurrentLevelSeed = () => session.currentLevelSeed;
+export const getLastLevelSeed   = () => session.lastLevelSeed;
+export const getLastLevelStreak = () => session.lastLevelStreak;
 
 // ---- Mutations ----
 
-// Called when entering a new level (fresh level, not a retry).
+// Called when entering a new level.
 export const startLevel = (seed) => {
+  session.lastLevelSeed = seed >>> 0;
+  session.lastLevelStreak = session.streak;
   session.lives = LIVES_PER_LEVEL;
   session.currentLevelSeed = seed >>> 0;
 };
@@ -85,4 +93,15 @@ export const endRun = () => {
 export const newRun = () => {
   session.streak = 0;
   session.lives = LIVES_PER_LEVEL;
+};
+
+// ---- Retry (design-v2.md §9.4, §10.3) ----
+
+export const requestRetry = () => { session.retryPending = true; };
+
+// Returns { seed, streak } if retry is pending, else null. Clears the flag.
+export const consumeRetry = () => {
+  if (!session.retryPending) return null;
+  session.retryPending = false;
+  return { seed: session.lastLevelSeed, streak: session.lastLevelStreak };
 };

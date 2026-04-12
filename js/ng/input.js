@@ -4,9 +4,19 @@
 // module via the polled-snapshot API (`pointerPosition()`, `pointerPressed()`,
 // `pointerHovering()`, `consumePointerReleased()`) just like v1 polled SDL.
 
+// Optional coordinate transform: canvas-pixel coords → logical coords.
+// Set by game states that need a custom mapping (e.g. camera inverse, menu scaling).
+let coordinateTransform = null;
+
 const state = {
+  // Transformed (logical) coordinates — world-space during gameplay,
+  // design-space during menus, canvas-pixel when no transform is set.
   x: 0,
   y: 0,
+  // Raw canvas-pixel coordinates — always available, used for screen-space
+  // hit-tests (HUD mute button, confirm dialog, etc.).
+  rawX: 0,
+  rawY: 0,
   pressed: false,      // a pointer is currently down on the canvas
   hovering: false,     // a mouse pointer is currently hovering the canvas
   activePointerId: null, // first pointer to go down; others are ignored
@@ -19,23 +29,34 @@ const state = {
   // case the game reads position a tick after the pointerup.
   releaseX: 0,
   releaseY: 0,
+  rawReleaseX: 0,
+  rawReleaseY: 0,
 };
 
 // ---- Public query API -------------------------------------------------------
 
-export const pointerPosition   = () => [state.x, state.y];
-export const pointerPressed    = () => state.pressed;
+export const pointerPosition     = () => [state.x, state.y];
+export const pointerPositionRaw  = () => [state.rawX, state.rawY];
+export const pointerPressed      = () => state.pressed;
 // Only mouse-type pointers ever set `hovering`. Touch pointers leave it false.
-export const pointerHovering   = () => state.hovering;
-export const pointerType       = () => state.pointerType;
+export const pointerHovering     = () => state.hovering;
+export const pointerType         = () => state.pointerType;
 
-// True for exactly one read after a pointerup. main-game.js calls this in
-// updateAiming(); after consumption the flag clears so it won't fire twice.
+// True for exactly one read after a pointerup. Returns { pos, raw } or null.
+// `pos` is in logical coords (world/design), `raw` is in canvas pixels.
 export const consumePointerReleased = () => {
   if (!state.releasedFlag) return null;
   state.releasedFlag = false;
-  return [state.releaseX, state.releaseY];
+  return {
+    pos: [state.releaseX, state.releaseY],
+    raw: [state.rawReleaseX, state.rawReleaseY],
+  };
 };
+
+// Set or clear the coordinate transform. States call this in initializeState
+// with a function (canvasX, canvasY) → [logicalX, logicalY], and the GSM
+// clears it between state transitions.
+export const setCoordinateTransform = (fn) => { coordinateTransform = fn; };
 
 // Used by main-menu-state / confirmation dialogs to click buttons. Queried
 // via a rising edge rather than the one-shot release flag: menus want "mouse
@@ -63,8 +84,18 @@ export const attachInput = (canvas) => {
     const rect = canvas.getBoundingClientRect();
     const scaleX = canvas.width / rect.width;
     const scaleY = canvas.height / rect.height;
-    state.x = (e.clientX - rect.left) * scaleX;
-    state.y = (e.clientY - rect.top) * scaleY;
+    const canvasX = (e.clientX - rect.left) * scaleX;
+    const canvasY = (e.clientY - rect.top) * scaleY;
+    state.rawX = canvasX;
+    state.rawY = canvasY;
+    if (coordinateTransform) {
+      const [lx, ly] = coordinateTransform(canvasX, canvasY);
+      state.x = lx;
+      state.y = ly;
+    } else {
+      state.x = canvasX;
+      state.y = canvasY;
+    }
   };
 
   canvas.addEventListener('pointerdown', e => {
@@ -108,6 +139,8 @@ export const attachInput = (canvas) => {
       state.releasedFlag = true;
       state.releaseX = state.x;
       state.releaseY = state.y;
+      state.rawReleaseX = state.rawX;
+      state.rawReleaseY = state.rawY;
     }
     // Touch pointers never hover. A mouse pointer leaving stays hovering
     // until pointerleave; don't clear `hovering` here.

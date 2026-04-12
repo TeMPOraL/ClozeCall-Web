@@ -3,22 +3,20 @@
 // The mute button lives next to BEST (§19 answer #5) so this module owns
 // both the render AND the hit-test for its icon.
 
-import { SCREEN_WIDTH } from './config.js';
 import * as audio from './audio.js';
 
 const HUD_FONT = '18px ui-monospace, Menlo, Consolas, monospace';
 const HUD_PAD = 12;
+const MUTE_W = 28;
+const MUTE_H = 24;
 
-// Where the mute icon lives, in design pixels. Computed once; used by render
-// and by the hit-test. Kept small enough to not crowd the "BEST N" text but
-// big enough to tap on mobile.
-const MUTE_BTN = {
-  w: 28,
-  h: 24,
-  // Top-right: flush to the top, inset from the right edge.
-  get x() { return SCREEN_WIDTH - HUD_PAD - this.w; },
-  get y() { return HUD_PAD - 4; },
-};
+// Compute the mute button rect from the current canvas width.
+const muteRect = (canvasW) => ({
+  x: canvasW - HUD_PAD - MUTE_W,
+  y: HUD_PAD - 4,
+  w: MUTE_W,
+  h: MUTE_H,
+});
 
 // Draw a single HUD text entry with monospace font + drop shadow.
 const drawHudText = (ctx, text, x, y, align) => {
@@ -34,8 +32,8 @@ const drawHudText = (ctx, text, x, y, align) => {
 
 // Render a simple speaker-icon glyph. Crude but recognizable: a box with
 // two tiny triangular sound waves (or a slash through it when muted).
-const drawMuteIcon = (ctx, muted) => {
-  const { x, y, w, h } = MUTE_BTN;
+const drawMuteIcon = (ctx, muted, canvasW) => {
+  const { x, y, w, h } = muteRect(canvasW);
   ctx.save();
   ctx.translate(x, y);
 
@@ -95,27 +93,27 @@ const drawMuteIcon = (ctx, muted) => {
  * @param {number} info.best
  */
 export const renderHud = (ctx, { lives, streak, best }) => {
-  // Lives, top-left. Use ♥ glyphs; fall back to asterisks is built-in since
-  // system monospace fonts all render U+2665 fine on every target OS.
+  const canvasW = ctx.canvas.width;
+  // Lives, top-left.
   const hearts = [];
   for (let i = 0; i < 3; i++) hearts.push(i < lives ? '\u2665' : '\u2661');
   drawHudText(ctx, `LIVES ${hearts.join(' ')}`, HUD_PAD, HUD_PAD, 'left');
 
   // Streak, top-center.
-  drawHudText(ctx, `STREAK ${streak}`, SCREEN_WIDTH / 2, HUD_PAD, 'center');
+  drawHudText(ctx, `STREAK ${streak}`, canvasW / 2, HUD_PAD, 'center');
 
   // Best, top-right. Leave room for the mute icon to the right.
-  drawHudText(ctx, `BEST ${best}`, SCREEN_WIDTH - HUD_PAD - MUTE_BTN.w - 8, HUD_PAD, 'right');
+  drawHudText(ctx, `BEST ${best}`, canvasW - HUD_PAD - MUTE_W - 8, HUD_PAD, 'right');
 
-  drawMuteIcon(ctx, audio.isMuted());
+  drawMuteIcon(ctx, audio.isMuted(), canvasW);
 };
 
 /**
- * Hit-test for the mute icon. Returns true if (px, py) in design pixels
- * falls within the mute button's rect. main-game.js consults this on
- * pointerup so it can swallow the tap before launching the ball.
+ * Hit-test for the mute icon. (px, py) must be in canvas-pixel coords.
+ * main-game.js consults this on pointerup so it can swallow the tap before
+ * launching the ball.
  */
-export const hudMuteContains = (px, py) => {
-  const { x, y, w, h } = MUTE_BTN;
+export const hudMuteContains = (px, py, canvasW) => {
+  const { x, y, w, h } = muteRect(canvasW);
   return px >= x && px <= x + w && py >= y && py <= y + h;
 };

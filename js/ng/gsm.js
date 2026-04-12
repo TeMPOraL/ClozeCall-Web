@@ -1,13 +1,15 @@
 // Cloze Call V2 — Game State Manager. Mirrors game-state-manager.lisp.
-// Unchanged from v1 except for a tiny addition: `onSkip(gsm)` dispatch helper
-// used by keyboard.js and input.js to forward skip intents to the current
-// state regardless of which kind of state it is.
+// Additions over v1: `onSkip/onKey` dispatch, canvas reference, coordinate
+// transform cleanup between state transitions.
+
+import { setCoordinateTransform } from './input.js';
 
 export class GameStateManager {
   constructor() {
     this.states = new Map();
     this.currentState = null;
     this.nextStateKw = null;
+    this.canvas = null;  // set by cloze-call.js after boot
   }
 
   init() {
@@ -36,6 +38,9 @@ export class GameStateManager {
     const next = this.states.get(this.nextStateKw);
     if (!next) throw new Error(`Nonexisting game state selected: ${this.nextStateKw}`);
     if (this.currentState) this.currentState.deinitializeState(this);
+    // Clear the coordinate transform between states so the incoming state
+    // starts with raw canvas-pixel coords until it sets its own transform.
+    setCoordinateTransform(null);
     this.currentState = next;
     this.nextStateKw = null;
     this.currentState.initializeState(this);

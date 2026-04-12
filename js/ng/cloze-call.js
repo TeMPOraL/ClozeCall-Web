@@ -87,6 +87,15 @@ const boot = async () => {
   await preloadAssets();
   if (status) status.remove();
 
+  // Resize handler: canvas internal resolution tracks the viewport.
+  // design-v2.md §3.2. Runs on load and on window resize.
+  const resizeCanvas = () => {
+    canvas.width  = canvas.clientWidth;
+    canvas.height = canvas.clientHeight;
+  };
+  resizeCanvas();
+  window.addEventListener('resize', resizeCanvas);
+
   attachInput(canvas);
 
   // Lazy-init AudioContext on the first user gesture anywhere on the canvas.
@@ -99,6 +108,7 @@ const boot = async () => {
   canvas.addEventListener('pointerdown', firstGesture);
 
   const gsm = new GameStateManager();
+  gsm.canvas = canvas;
   gsm.init();
 
   attachKeyboard(gsm);

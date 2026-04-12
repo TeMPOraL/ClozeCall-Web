@@ -6,6 +6,7 @@ const SKIP_KEYS = new Set(['Space', 'Enter', 'NumpadEnter']);
 const TRACKED_KEYS = new Set([
   'Space', 'Enter', 'NumpadEnter', 'Escape',
   'KeyY', 'KeyN',          // confirm dialog
+  'KeyR',                  // shot forfeit (§9.5)
   'KeyS',                  // share (future)
   'KeyM',                  // mute toggle
   'ArrowUp', 'ArrowDown',  // menu nav (optional)
