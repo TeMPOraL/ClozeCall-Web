@@ -21,7 +21,7 @@ V2 addresses every item in v1 `design.md §5` plus the four explicit upgrades th
 
 - **mobile/touch support** with tap-and-drag aiming,
 - **a short aim preview line** that integrates gravity forward and shows where the ball will actually go,
-- **viewport-responsive scaling** of the canvas,
+- **viewport-filling canvas with dynamic camera** that zooms out to keep the ball visible during flight,
 - **60 Hz fixed-timestep physics** and 60 Hz rendering (replacing v1's 30 Hz cap),
 - **mass-weighted centroid** in the escape-velocity computation (correcting the original's physics bug).
 
@@ -34,7 +34,9 @@ Additionally, v2 introduces:
 - fade-in/fade-out transitions between screens,
 - synthesized audio via Web Audio API,
 - deterministic PRNG with shareable seed URLs,
-- combined edge-arrow + circle-arc off-screen indicator using `marker.png`.
+- combined edge-arrow + circle-arc off-screen indicator using `marker.png`,
+- shot forfeit (abort a flight mid-simulation),
+- level retry on defeat (replay the same layout).
 
 ### 1.1 What is explicitly unchanged
 
@@ -45,12 +47,12 @@ To keep scope focused, v2 does **not** touch the following (and any change there
 - The Euler integrator (`v += F·dt/m`, `x += v·dt`) — only `dt` changes (and that's automatic from the new timestep).
 - The 11-cell candidate grid and ±25 px jitter used for planet/hole placement (though the *count* scales with difficulty — see §11).
 - The ball's fixed starting position at `(50, 50)` and its effective mass of 1.
-- The `800 × 600` design resolution. Only the on-screen presentation scales; the physics world stays 800 × 600.
+- The `800 × 600` **world** coordinate space. The canvas now fills the viewport and a dynamic camera controls what's visible (§3), but all physics, collision, and level-generation math still operates in the 800 × 600 world.
 - The `ball.png` / `hole.png` color-keying workaround documented in v1 `design.md §4 row 8` (ship-as-is).
 
 ### 1.2 Target platforms
 
-- **Desktop**: mouse + keyboard, any modern browser (Chrome, Firefox, Safari, Edge), any viewport ≥ 640×480 ideal; smaller viewports letterbox.
+- **Desktop**: mouse + keyboard, any modern browser (Chrome, Firefox, Safari, Edge), any viewport size. The canvas fills the viewport; no letterboxing.
 - **Mobile**: iOS Safari, Android Chrome, in portrait and landscape. Primary interaction is touch. Minimum comfortable width around 360 CSS px.
 - **Input assumptions**: Pointer Events API (`pointerdown`/`move`/`up`/`cancel`) unifies mouse, touch, and stylus. Available in all target browsers.
 
@@ -92,39 +94,100 @@ Halving `dt` (33.3 ms → 16.7 ms) reduces Euler integration error, particularly
 
 ---
 
-## 3. Viewport scaling & responsive canvas
+## 3. Viewport-filling canvas & dynamic camera
 
-### 3.1 What v1 does
+### 3.1 What v1 / initial v2 did
 
-V1 sets the canvas to intrinsic `800 × 600` and does not scale it. On a 4K display it renders as a small rectangle in the center; on a phone it overflows and scrolls.
+V1 sets the canvas to intrinsic `800 × 600` and does not scale it. On a 4K display it renders as a small rectangle in the center; on a phone it overflows and scrolls. The initial v2 CSS-scaled the canvas preserving a 4:3 aspect ratio with black letterboxing — better, but on mobile (especially portrait) the top and bottom are wasted black bars and the actual play area is small.
 
-### 3.2 V2 design
+### 3.2 V2 design: viewport-filling canvas
 
-- **The canvas keeps an intrinsic resolution of `800 × 600`** — the game's world coordinates are unchanged. Planets, the ball, the hole, and all collision math stay in design pixels.
-- **CSS scales the canvas to fit the viewport**, preserving the 4:3 aspect ratio with letterboxing:
+The canvas fills the **entire viewport**. No aspect-ratio constraint, no letterboxing.
 
-  ```css
-  html, body { height: 100%; margin: 0; background: #000; overflow: hidden; }
-  #wrap {
-    position: fixed; inset: 0;
-    display: grid; place-items: center;
-  }
-  #game {
-    width: min(100vw, calc(100vh * 4 / 3));
-    height: min(100vh, calc(100vw * 3 / 4));
-    image-rendering: auto;
-    touch-action: none;   /* critical for mobile */
-  }
-  ```
+```css
+html, body { height: 100%; margin: 0; background: #000; overflow: hidden; }
+#wrap { position: fixed; inset: 0; }
+#game {
+  width: 100%; height: 100%;
+  touch-action: none;
+  image-rendering: auto;
+}
+```
 
-- **Aspect ratio preserved** via the `min(...)` trick — no CSS JavaScript sizing needed.
-- **Input coordinates converted to design pixels** in `input.js` using the bounding-rect scale factor (v1 already does this; no change).
-- **Orientation**: works in both portrait and landscape. In portrait on a phone the canvas becomes quite small; acceptable for a simple aim-and-fire game. No rotation prompt.
-- **HiDPI / devicePixelRatio**: skipped for v2 — the pixel art style (intro backgrounds, planet sprites) reads fine at 1x. If we later want crisp scaling, we'd set `canvas.width = 800 * dpr` and scale the 2D context, but that complicates the fixed-800×600 world-coordinate contract. Deferred to v3.
+- **Canvas internal resolution tracks the viewport** via a JS `resize` handler: `canvas.width = canvas.clientWidth; canvas.height = canvas.clientHeight;`. This runs on load and on `window.resize`.
+- The `800 × 600` **world** coordinate space is unchanged. All physics, collision math, level generation, and object placement still operate in world pixels. The camera (§3.3) maps between world and canvas coordinates.
+- **Orientation**: works in portrait and landscape. In portrait the game occupies the full phone screen — no wasted space. The camera's default zoom adjusts so the 800×600 world area fits within whatever shape the viewport is.
+- **HiDPI / devicePixelRatio**: still skipped for v2. The canvas resolution matches CSS pixels, not physical pixels. Deferred to v3.
 
-### 3.3 Tunables
+### 3.3 Dynamic camera
 
-- `--cc-max-width` / `--cc-max-height` CSS vars could limit the canvas on ultra-wide monitors; not included initially.
+A camera system controls what portion of the world is visible and at what scale. New module `js/ng/camera.js`.
+
+**Camera state:**
+- `center: [cx, cy]` — world-space point at the center of the screen.
+- `zoom: number` — scale factor. `1.0` means 1 world pixel = 1 canvas pixel at the reference (800×600) resolution. Values < 1.0 show more of the world (zoomed out).
+
+**Behavior by game sub-state:**
+
+- **Aiming**: camera centered on the world midpoint `[400, 300]`, zoom set so the full `800 × 600` world area fits the canvas with a small margin (accounting for the canvas's actual aspect ratio). The ball at `(50, 50)` and all planets are always visible. Extra canvas space beyond the 800×600 world shows starfield.
+- **Simulation**: each frame, compute a bounding box containing all planets, the hole, **and the ball**. Add generous padding (~100 world-units per side). Compute the zoom needed to fit that box into the canvas. Smoothly lerp both `center` and `zoom` toward the target values (e.g. `lerp(current, target, 0.05)` per frame) to avoid jarring jumps. The camera dynamically zooms out as the ball flies away, and zooms back in if it returns.
+- **Confirm-exit overlay**: camera state frozen (no physics ticking, no camera updates).
+
+**Zoom limits:**
+- **Ceiling** (max zoom in): enough to show the full 800×600 world with margin. This is the aiming default.
+- **Floor** (max zoom out): `0.15` or similar. Even at `OFFWORLD_MAX_DISTANCE` (2048 px from origin), the world should remain recognizable. Below this floor, the ball is tiny but visible — and the off-world check will fire soon anyway.
+
+**Canvas transform:** rendering applies the camera via `ctx` transforms:
+```
+ctx.translate(canvasW / 2, canvasH / 2);
+ctx.scale(zoom * scaleFactor, zoom * scaleFactor);
+ctx.translate(-camera.cx, -camera.cy);
+```
+where `scaleFactor` accounts for the canvas resolution relative to the 800×600 reference (e.g. on a 1600px-wide canvas, `scaleFactor = 2` so the default zoom of 1.0 still shows the full 800px world). Everything drawn between `save`/`restore` is in world space.
+
+### 3.4 Background handling
+
+`level-background.png` is an 800×600 starfield texture. With a camera that can zoom out, we'd see its edges — and on non-4:3 viewports, even the default view extends beyond the texture.
+
+**Solution: treat the background as infinitely distant.** Stars don't move or scale with the camera. The background is drawn at **screen coordinates** (before the camera transform), tiled in a 3×3 grid centered on the viewport to guarantee full coverage at any zoom level. The dark nebula texture is visually seamless enough that tiling seams are unnoticeable.
+
+### 3.5 Rendering pipeline (main-game)
+
+```
+1. Clear entire canvas to black.
+2. Draw tiled background (screen space — before camera transform).
+3. ctx.save(); apply camera transform.
+4.   Draw all planets.
+5.   Draw the hole.
+6.   Draw the ball.
+7.   Draw aim line + aim preview (aiming only).
+8.   Draw off-screen indicators (simulation only, if ball is outside visible area).
+9. ctx.restore();
+10. Draw HUD (screen space — fixed to canvas edges).
+11. Draw confirm-exit overlay (screen space, if active).
+```
+
+The HUD, menus, and overlays are always in screen space and unaffected by camera zoom/pan.
+
+### 3.6 Input: camera-aware coordinate conversion
+
+Pointer events arrive in CSS pixel coordinates. The conversion pipeline is:
+
+1. `clientX/Y` → canvas pixels via `getBoundingClientRect()` and `canvas.width / rect.width` scale.
+2. Canvas pixels → world coordinates via inverse camera transform:
+   ```
+   worldX = (canvasX - canvasW / 2) / (zoom * scaleFactor) + camera.cx
+   worldY = (canvasY - canvasH / 2) / (zoom * scaleFactor) + camera.cy
+   ```
+
+`input.js` needs access to the current camera state for step 2. Exposed via a `setCoordinateTransform(fn)` hook that `main-game.js` sets on state entry and clears on exit. Non-gameplay states (menus, screen-states) don't use the camera; they continue using the simpler canvas-pixel conversion with their own coordinate system.
+
+### 3.7 Tunables
+
+- `CAMERA_LERP_SPEED` — how quickly the camera catches up to its target (0.05 = smooth, 0.2 = snappy). Default 0.05.
+- `CAMERA_PADDING` — world-units of margin around the bounding box (default 100).
+- `CAMERA_ZOOM_FLOOR` — minimum zoom level (default 0.15).
+- `CAMERA_ZOOM_CEILING` — maximum zoom level, computed per-frame to fit the 800×600 world.
 
 ---
 
@@ -142,7 +205,7 @@ V1 listens to `mousedown`/`mouseup`/`mousemove` separately on the canvas (down) 
 - **Pointer state**:
   - `pressed` — a pointer is currently down on the canvas.
   - `hovering` — a mouse pointer is currently over the canvas (touch never sets this).
-  - `x`, `y` — current pointer position in design-pixel (`800×600`) coordinates.
+  - `x`, `y` — current pointer position in **world** coordinates (converted from screen pixels via inverse camera transform — see §3.6). Non-gameplay states (menus) use a simpler screen-space conversion.
 - **Visibility rule** for the aim line + guide preview: visible when `hovering || pressed`. This means:
   - **Mouse users** see the aim line constantly while the cursor is on the canvas (matches v1 feel).
   - **Touch users** see the aim line only while dragging. After release, the aim line vanishes. There's no "hover" on touch.
@@ -152,13 +215,19 @@ V1 listens to `mousedown`/`mouseup`/`mousemove` separately on the canvas (down) 
 - **Keyboard**:
   - `Space` or `Enter` — skip the currently displayed intro/victory/defeat screen once its minimum display time has passed (see §12.2).
   - `Space` or `Enter` on the main menu — PLAY.
-  - `Esc` — from a game, return to the main menu (after confirmation? Probably just no confirmation for v2 simplicity).
+  - `Esc` — from the main game, pop a confirmation dialog before returning to the main menu (§9.4).
+  - `R` — during simulation, forfeit the current shot (§9.5).
+  - `M` — toggle mute.
   - All key handling goes through a small `keyboard.js` module to keep it out of `input.js`.
 - **Preventing unwanted browser behaviors**: call `e.preventDefault()` on `pointerdown` to kill text-selection and iOS long-press. Call `e.preventDefault()` on the relevant keydowns to stop Space from scrolling.
 
-### 4.3 Design-pixel conversion
+### 4.3 Coordinate conversion
 
-The coordinate conversion logic from v1 (`input.js`) stays, but is generalized: any pointer event's `clientX`/`clientY` becomes a `[x, y]` in design pixels by using the canvas's `getBoundingClientRect()` and the `canvas.width / rect.width` scale. This already handles the CSS-scaled canvas from §3 automatically.
+During gameplay (`MainGameState`), pointer coordinates are converted to **world** coordinates via the two-step pipeline described in §3.6: CSS pixels → canvas pixels → world coordinates (inverse camera transform). This means the player always aims in world space regardless of camera zoom or pan.
+
+During menu / screen states, the camera is not active. Coordinates are converted to the state's own design space using the simpler `canvas.width / rect.width` scale factor, as in initial v2.
+
+`input.js` exposes a `setCoordinateTransform(fn)` hook that `main-game.js` sets to the inverse camera function on state entry and clears on exit.
 
 ---
 
@@ -187,7 +256,7 @@ Gravity from multiple bodies is hard to intuit, especially on a first playthroug
   - **Dashed pattern** via `ctx.setLineDash([6, 4])` so it reads clearly against the stellar background.
   - **Uniform alpha along the length** (no fade) — answered in §19, chosen for simplicity and consistent legibility.
 - **Does not** include the aim line itself — the existing straight line-to-cursor stays as-is (its green→red gradient is the force indicator, now aligned with the new cap — see §5.3). The preview is drawn in addition, from the ball forward along the predicted trajectory.
-- **Visual layering**: aim line → preview → mouse/touch cursor marker (if any). Drawn after the main render-common pass, above planets/ball/hole.
+- **Visual layering**: aim line → preview → mouse/touch cursor marker (if any). Drawn inside the camera transform (world space), after planets/ball/hole but before `ctx.restore()`.
 
 ### 5.3 Interaction with the launch-power cap
 
@@ -243,23 +312,22 @@ Small: off-world detection triggers marginally sooner for balls fleeing in the d
 
 V1 draws a large anti-aliased green circle centered on the off-screen ball, with radius equal to the distance from the ball to its clamped edge-marker point. Only a slim arc intrudes onto the visible screen near the edge closest to the ball. Growing arc = farther ball = more dramatic sweep = nice feedback, per postmortem recall. `marker.png` is loaded but never drawn.
 
-### 7.2 V2 design
+### 7.2 V2 design (with dynamic camera)
 
-- **Keep the circle arc** as-is. It's good feedback.
+With the dynamic camera (§3.3), the ball is **almost always visible** during simulation — the camera zooms out to keep it in frame. The off-screen indicators are therefore a **secondary fallback** rather than the player's primary feedback about ball position. They activate only when the ball exceeds the camera's visible area, which can happen transiently during rapid zoom-out or at the zoom floor.
+
+- **Keep the circle arc** as-is, drawn in **world space** (inside the camera transform). It's good feedback for the rare moments the ball outruns the camera.
 - **Also draw `marker.png`** as an edge arrow:
-  - Positioned on the screen edge closest to the ball (clamped to `(0..SCREEN_WIDTH, 0..SCREEN_HEIGHT)` with a `MARKER_DISTANCE_TO_SCREEN_BORDER` offset — v1 already computes this position for the arc).
-  - Rotated so the arrow points toward the ball's real (off-screen) position. Rotation angle = `atan2(ball.y - edge.y, ball.x - edge.x)`.
+  - Positioned on the visible screen edge closest to the ball (clamped to the camera's current visible rect in world coordinates).
+  - Rotated so the arrow points toward the ball's real position. Rotation angle = `atan2(ball.y - edge.y, ball.x - edge.x)`.
   - The sprite is authored as pointing right (positive X). If it isn't, we apply a constant rotation offset determined by inspection when wiring it up.
-  - Drawn with `ctx.save(); ctx.translate(edge.x, edge.y); ctx.rotate(angle); ctx.drawImage(marker, -w/2, -h/2); ctx.restore();` (centered).
-- **Distance-based fade** (optional nicety, cheap): the arc alpha can scale with the ball's speed (faster ball = more opaque arc). Not required for v2 but trivial if we want it.
-- **No change** to the offscreen detection predicate.
+  - Drawn in **world space** so it zooms/pans with the camera.
+- **Off-screen detection** now tests whether the ball is outside the camera's **visible world rect** (derived from canvas size, camera center, and zoom), not the fixed 800×600 design viewport.
+- The markers still disappear the moment the ball re-enters the visible area.
 
 ### 7.3 Result
 
-On-screen at a glance the player sees:
-- A sharp arrow at the edge pointing toward the ball (direction).
-- A sweeping green arc fragment on the same edge (distance + velocity).
-- Both disappear the moment the ball re-enters the viewport.
+In practice the dynamic camera means the player almost never sees these indicators — the ball stays on-screen as the view zooms out. But for edge cases (zoom floor hit, very fast ball), the arrow + arc provide a safety net.
 
 `marker.png` finally earns its keep.
 
@@ -269,7 +337,7 @@ On-screen at a glance the player sees:
 
 ### 8.1 Elements
 
-Three pieces of text, monospace, drawn on top of the game canvas (after the render-common layer, before overlays like aim line/preview):
+Three pieces of text, monospace, drawn on top of the game canvas in screen space (after the camera `ctx.restore()`, so they're unaffected by zoom/pan — see §3.5 step 10):
 
 - **LIVES** — top-left. Rendered as `♥ ♥ ♥` (or fallback `* * *`) with lost lives dimmed. Alternative: plain text `Lives: 3`.
 - **STREAK** — top-center. `STREAK 7` means the player has won 7 consecutive levels in the current run.
@@ -278,10 +346,10 @@ Three pieces of text, monospace, drawn on top of the game canvas (after the rend
 ### 8.2 Visual design
 
 - White text with a thin black drop-shadow (offset `(1, 1)`) to stay legible against both the stellar background and the light planet sprites.
-- Font: system monospace (`ui-monospace, Menlo, Consolas, monospace`), 18-20 px design pixels.
-- Padding: 12 design pixels from the canvas edge.
+- Font: system monospace (`ui-monospace, Menlo, Consolas, monospace`), 18-20 px in canvas pixels (not world pixels — the HUD does not zoom with the camera).
+- Padding: 12 canvas pixels from the canvas edge.
 - Rendered via `ctx.fillText` and `ctx.strokeText`. No HTML overlays.
-- Drawn by a new `renderHud(ctx, state)` function called from `MainGameState.render` after the common layer and before any sub-state overlays.
+- Drawn in **screen space** (after `ctx.restore()` from the camera transform) by `renderHud(ctx, state)` called from `MainGameState.render`. This ensures the HUD stays legible and fixed-size regardless of camera zoom.
 
 ### 8.3 Visibility
 
@@ -333,6 +401,8 @@ Three pieces of text, monospace, drawn on top of the game canvas (after the rend
                    └────────────┘
 ```
 
+**(Updated)** The DEFEATED state now has two exits: **RETRY** (re-enters MAIN GAME with the same level layout; streak resets) and **MENU** (returns to MAIN MENU). See §9.4.
+
 ### 9.2 Main menu
 
 - New `MainMenuState` (subclass of `GameState`).
@@ -356,9 +426,23 @@ Three pieces of text, monospace, drawn on top of the game canvas (after the rend
 
 ### 9.4 Retry / game-over flow
 
-- **Defeat path**: `MAIN GAME (lives = 0)` → `DEFEATED` (2-second base + 0.25 s fade each side, skippable after 0.3 s) → `MAIN MENU`. Streak resets to 0. Best streak updated in localStorage if the just-ended streak beat it.
+- **Defeat path**: `MAIN GAME (lives = 0)` → `DEFEATED` (2-second base + 0.25 s fade each side, skippable after 0.3 s). The defeated screen shows two options:
+  - **RETRY** — re-seeds the PRNG to the same state as the start of the failed level (using `session.lastLevelSeed`) and re-enters `MAIN GAME` at the same difficulty (streak preserved for difficulty parameters only). The streak counter itself resets to 0 — retry is for the satisfaction of solving a specific layout, not for streak farming. Lives reset to 3.
+  - **MENU** (default if the hold timer expires) — returns to `MAIN MENU`. Streak resets to 0. Best streak updated in localStorage if the just-ended streak beat it.
 - **Victory path**: `MAIN GAME (hole hit)` → `VICTORIOUS` (fade-in + hold; no auto-advance) with an explicit **NEXT** button overlaid on the picture. Tapping NEXT / Space / Enter triggers the fade-out, advances streak + 1, bumps difficulty per §11, and re-enters `MAIN GAME`. Lives reset to 3 between levels (three lives per level, not three per run).
 - **Esc from main game**: pops a lightweight `ConfirmExitState` ("Return to menu? YES / NO"). YES → `MAIN MENU`, streak counts as 0 (player bailed). NO → resume main game exactly where it was. The underlying main-game scene is frozen while the confirm overlay is up (physics not ticked, previous render snapshot shown dimmed).
+
+### 9.5 Shot forfeit
+
+During the `simulation` sub-state, the player can **forfeit the current shot** — a deliberate bail-out when the ball is in a useless orbit or flying off into deep space.
+
+- **Trigger**: tap/click anywhere on the canvas (except the mute button), or press `Space` or `R`.
+- **Grace period**: forfeits are ignored for the first **0.5 seconds** of flight, preventing an accidental double-tap from immediately wasting a life.
+- **Effect**: identical to an off-world loss — lose one life, reset ball to `(50, 50)`, return to `aiming`. If this was the last life, transition to `defeated`. Camera smoothly returns to the aiming default zoom.
+- **Audio**: plays `sfxForfeit` (a short downward sweep, distinct from planet-collision and off-world sounds).
+- **Visual hint**: after **2 seconds** of flight, draw a small faded text at the bottom of the screen: `"tap to forfeit shot"`. This teaches the mechanic without cluttering the UI. The hint is drawn in screen space (post-camera, like the HUD).
+
+This directly addresses the most common player complaint: the ball spending minutes off-screen in a wide orbit that technically isn't off-world (speed < escape velocity) but will never return to the playing field. The player no longer has to wait helplessly.
 
 ---
 
@@ -383,6 +467,8 @@ Three pieces of text, monospace, drawn on top of the game canvas (after the rend
 - Read on main-menu state init.
 - Written whenever a defeat finalizes a streak that beat the previous best.
 - Errors from `localStorage` (Safari private mode, etc.) are swallowed — best streak simply doesn't persist. Game still works.
+
+**Retry state** (in-memory only): `session.js` also records the PRNG seed and streak at the start of each level (`lastLevelSeed`, `lastLevelStreak`). These survive `endRun()` so the defeated screen's RETRY button can re-seed the generator and regenerate the exact same level layout. Not persisted to `localStorage` — retry is a within-session convenience. For cross-session replay, use the seed URL (§14).
 
 ### 10.4 Shareable levels
 
@@ -517,6 +603,7 @@ class ScreenGameState extends GameState {
 | Defeat screen enter    | `defeated` state init               | Descending minor thirds (A4, F4, D4) over 800 ms   |
 | Menu button hover      | pointer enters button rect (mouse)  | Short 20 ms sine blip ~800 Hz                      |
 | Menu button click      | button activated                    | Short 30 ms sine at 1200 Hz                        |
+| Shot forfeit           | player aborts flight (§9.5)         | ~200 ms descending sweep, distinct from collision   |
 
 ### 13.3 Architecture
 
@@ -577,7 +664,7 @@ class ScreenGameState extends GameState {
 ### 15.1 New files (copied from v1 and then modified as noted)
 
 - `index-ng.html` — V2 entry point. Minimal HTML with a responsive wrapper, canvas, mute button, and `<script type="module" src="js/ng/cloze-call.js">`.
-- `css/ng/style.css` — responsive canvas (`min(100vw, calc(100vh*4/3))`), `touch-action: none`, mute button styling.
+- `css/ng/style.css` — viewport-filling canvas (no aspect-ratio constraint), `touch-action: none`.
 - `js/ng/config.js` — updated constants. `FIXED_DT_MS = 1000/60`, `LAUNCH_SPEED_CAP = 400`, new `PREVIEW_MAX_ARC_LENGTH`, `PREVIEW_MAX_STEPS`, `FADE_IN_DURATION`, `FADE_OUT_DURATION`, `SCREEN_MIN_DISPLAY_TIME`, `DIFFICULTY` block. `LAUNCH_SPEED_CAP_AT_INDICATOR_MAX` flag is gone (answered: drop).
 - `js/ng/math.js` — unchanged from v1.
 - `js/ng/gsm.js` — unchanged from v1.
@@ -593,8 +680,9 @@ class ScreenGameState extends GameState {
 - `js/ng/aim-preview.js` — new. Forward-integration helper used by `main-game.js`.
 - `js/ng/hud.js` — new. HUD rendering (lives / streak / best + mute icon click-target).
 - `js/ng/main-menu-state.js` — new. `MainMenuState`, `HowToPlayState`, `AboutState`, `ConfirmExitState` co-located.
-- `js/ng/main-game.js` — 60 Hz tuned, mass-weighted centroid fix, aim-preview, edge-arrow + arc, HUD integration, audio hooks, ESC → confirm dialog, victory → explicit NEXT button, no `LAUNCH_SPEED_CAP_AT_INDICATOR_MAX` flag (always capped).
-- `js/ng/cloze-call.js` — main loop = `requestAnimationFrame` + accumulator (60 Hz physics). Registers `main-menu` as the initial state. Parses `#seed=...&streak=...` on boot. Wires `AudioContext` to the first `pointerdown`. `test-state` is *not* registered (answered: strip).
+- `js/ng/camera.js` — new. Dynamic camera: center, zoom, lerp, bounding-box fit, inverse transform for input coordinates (§3.3).
+- `js/ng/main-game.js` — 60 Hz tuned, mass-weighted centroid fix, aim-preview, edge-arrow + arc, HUD integration, audio hooks, ESC → confirm dialog, victory → explicit NEXT button, no `LAUNCH_SPEED_CAP_AT_INDICATOR_MAX` flag (always capped). Camera integration: world-space rendering inside camera transform, screen-space HUD outside. Shot forfeit (§9.5).
+- `js/ng/cloze-call.js` — main loop = `requestAnimationFrame` + accumulator (60 Hz physics). Registers `main-menu` as the initial state. Parses `#seed=...&streak=...` on boot. Wires `AudioContext` to the first `pointerdown`. `test-state` is *not* registered (answered: strip). Dynamic canvas resize handler.
 
 ### 15.2 Shared / unchanged
 
@@ -613,7 +701,7 @@ This table summarizes all v2 decisions, mirroring the one in v1 `design.md §4`.
 |-------------------------|------------------------------------------------------------------------------------------------------|-----------|
 | Physics timestep        | Fixed 60 Hz (was 30 Hz in v1)                                                                         | §2        |
 | Render loop             | `requestAnimationFrame` with accumulator; pauses with tab                                             | §2        |
-| Viewport                | CSS-scaled canvas, 4:3 letterboxed, `touch-action: none`                                              | §3        |
+| Viewport                | Viewport-filling canvas, no letterbox; dynamic camera zooms to keep ball visible                       | §3        |
 | Input                   | Pointer Events (mouse + touch + pen), keyboard for screen-skip and ESC                                 | §4        |
 | Aim line                | Straight ball→cursor, green→red lerp saturating at 400 px                                             | §5.3      |
 | Aim preview             | Forward-integrated dashed polyline, 300 px arc length cap, stops on planet collision                 | §5        |
@@ -622,7 +710,7 @@ This table summarizes all v2 decisions, mirroring the one in v1 `design.md §4`.
 | Off-screen marker       | Circle arc (kept) + `marker.png` edge arrow rotated toward ball                                       | §7        |
 | HUD                     | Lives / Streak / Best, monospace, canvas-drawn                                                        | §8        |
 | Main menu               | New state: PLAY / HOW TO PLAY / ABOUT; shows BEST STREAK                                              | §9        |
-| Retry flow              | Defeat → menu (streak resets). Victory → auto-advance (streak++).                                     | §9.4      |
+| Retry flow              | Defeat → RETRY (same level) or MENU. Victory → explicit NEXT (streak++).                              | §9.4      |
 | Level progression       | Streak-driven difficulty: +1 planet every 3 levels (cap 6), +50 base mass every 2 levels (cap 1500) | §11       |
 | Persistence             | `localStorage` for best streak and mute state                                                         | §10.3, §13.3 |
 | Screen fades            | 0.25 s fade in / hold / 0.25 s fade out                                                               | §12.1     |
@@ -630,6 +718,9 @@ This table summarizes all v2 decisions, mirroring the one in v1 `design.md §4`.
 | Audio                   | Web Audio synthesized sfx; mute toggle; lazy init on first gesture                                    | §13       |
 | PRNG                    | Mulberry32, seedable from URL hash                                                                    | §14.1     |
 | Sharing                 | Victory-screen "share URL" with seed + streak                                                         | §14.3     |
+| Dynamic camera          | World-space rendering with zoom-out during simulation; screen-space HUD and background                | §3.3      |
+| Shot forfeit            | Tap/Space/R during simulation (after 0.5 s grace) to abort and lose a life                            | §9.5      |
+| Level retry             | RETRY button on defeat screen re-seeds PRNG for same level; streak resets                             | §9.4      |
 | Out of scope for v2     | Leaderboards, daily challenges, shot/time per-level scoring, HiDPI canvas scaling, achievements       | §17       |
 
 ---
@@ -643,7 +734,7 @@ Things deliberately NOT in v2, to keep scope bounded:
 - **Leaderboards / daily challenges / cloud sync.** All state is local.
 - **Asset-based sfx / music.** Everything is synthesized.
 - **Level editor.** Deterministic seeds are as close as v2 gets.
-- **Portrait-optimized UI.** Scaling via letterbox is enough; portrait just shows a smaller game.
+- **Portrait-optimized UI beyond viewport-filling.** The viewport-filling canvas + dynamic camera (§3) handle portrait well; no further layout work needed.
 - **Achievements.**
 - **Accessibility features** (high-contrast mode, reduced-motion respect, ARIA labels on menu buttons) — should be v3. Worth flagging: the fade-in/out and audio choices would benefit from respecting `prefers-reduced-motion` and adding a volume slider.
 - **Replays / shareable runs.** Seed + streak share one level, not a whole playthrough.
@@ -653,23 +744,32 @@ Things deliberately NOT in v2, to keep scope bounded:
 
 ## 18. Implementation order (suggested)
 
-A build order that keeps the game playable after each step, so we can stop at any point with a working build:
+Steps 1–12 are the original v2 build order (all completed). Steps 13–19 are post-playtesting additions driven by player feedback.
 
-1. **Main loop swap** (30 Hz setInterval → 60 Hz RAF accumulator). Pure mechanical, no visual change.
-2. **Viewport scaling CSS** + pointer-events input module. Game works on phones from this point on.
-3. **Mass-weighted centroid fix** — tiny; just drop it in.
+**Original v2 (completed):**
+
+1. **Main loop swap** (30 Hz setInterval → 60 Hz RAF accumulator).
+2. **Viewport scaling CSS** + pointer-events input module.
+3. **Mass-weighted centroid fix**.
 4. **Launch cap retune** to 400 px with unified constant.
-5. **Aim preview line** — the most interesting single feature; most satisfying to land early.
-6. **Off-screen arrow + arc** (quick).
-7. **HUD** (lives / streak placeholder / best placeholder).
-8. **Fade-ins/outs + skippable screens** — screens are independent; doesn't break main game.
+5. **Aim preview line**.
+6. **Off-screen arrow + arc**.
+7. **HUD** (lives / streak / best).
+8. **Fade-ins/outs + skippable screens**.
 9. **Main menu + retry flow + streak logic + localStorage**.
-10. **Level progression / difficulty ramp** — wires into streak from step 9.
+10. **Level progression / difficulty ramp**.
 11. **PRNG + seed URLs + share button**.
 12. **Audio module + sfx + mute toggle**.
-13. **Polish pass**: play 10 runs, tune `DIFFICULTY` constants, verify mobile feel, adjust fades if too slow, etc.
 
-Each step is independently shippable. The user can decide to stop after any of them and we'll have a strictly-better build than v1.
+**Post-playtesting additions (§3 rewrite, §9.4–9.5):**
+
+13. **Dynamic camera module** (`camera.js`) — center/zoom state, bounding-box fit, lerp, inverse transform. Integrate into `main-game.js` rendering pipeline. Steps 13–16 are tightly coupled and should land together.
+14. **Viewport-filling canvas** — CSS change (drop 4:3 letterbox), JS resize handler, canvas resolution tracks viewport.
+15. **Camera-aware input** — inverse transform in `input.js` so pointer → world coords at any zoom.
+16. **Background tiling** — draw `level-background.png` at screen coordinates, tiled, before camera transform.
+17. **Shot forfeit** — simulation sub-state change, grace period timer, hint text, sfx.
+18. **Level retry** — `session.js` records last-level seed/streak; RETRY button on `DefeatedState`.
+19. **Polish pass**: tune camera lerp speed, zoom limits, forfeit grace period, test on mobile portrait/landscape.
 
 ---
 
