@@ -23,6 +23,7 @@ import { GameStateManager } from './gsm.js';
 import { ScreenGameState, VictoryState, DefeatedState } from './screen-state.js';
 import { MainGameState } from './main-game.js';
 import { MainMenuState, HowToPlayState, AboutState } from './main-menu-state.js';
+import { debugInit } from './debug.js';
 
 console.log('Hello from Cloze-Call (ng)');
 
@@ -134,6 +135,9 @@ const boot = async () => {
   // intended.
   gsm.changeState(startDirect ? 'main-game' : 'main-menu');
   gsm.enforceProperState();
+
+  // Debug overlay: check for ?debug URL parameter (design-v2.md §15.2).
+  debugInit();
 
   // Debug hook: expose the GSM under window.__cc for smoke tests and
   // ad-hoc console inspection. Safe in production; harmless if unused.

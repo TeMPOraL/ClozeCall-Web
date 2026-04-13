@@ -99,3 +99,10 @@ export const LIVES_PER_LEVEL = 3;
 export const LS_BEST_STREAK = 'cloze-call:v2:best-streak';
 export const LS_MUTED       = 'cloze-call:v2:muted';
 export const LS_SEEN_INTRO  = 'cloze-call:v2:seen-intro';
+
+// ---- Debug overlay (design-v2.md §15) ----
+export const DEBUG_TRAIL_SAMPLE_INTERVAL = 6;   // physics ticks between samples (60/6 = 10 Hz)
+export const DEBUG_TRAIL_MAX_POINTS = 3000;     // circular buffer capacity (~5 min at 10 Hz)
+export const DEBUG_TRAIL_DOT_RADIUS_PX = 3;     // screen-pixel radius of trail dots
+export const DEBUG_CONTOUR_GRID_RES = 10;       // world-pixel cell size for potential grid
+export const DEBUG_CONTOUR_LEVELS = 16;         // number of equipotential contour lines

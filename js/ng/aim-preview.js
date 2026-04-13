@@ -71,15 +71,24 @@ export const computeAimPreview = ({ startPosition, startVelocity, bodies, ballRa
   // Degenerate: no launch velocity -> no preview beyond the starting point.
   if (vx === 0 && vy === 0) return points;
 
+  const dt = FIXED_DT_SECONDS;
+  const invM = 1 / ballMass;
+
   for (let step = 0; step < PREVIEW_MAX_STEPS; step++) {
-    // Gravity: same formula as the real physics step.
-    const field = computeGravityField(bodies, [px, py]);
-    // applyForce: v += field * G * dt / mass; then x += v * dt.
-    const invM = 1 / ballMass;
-    vx += field[0] * G * FIXED_DT_SECONDS * invM;
-    vy += field[1] * G * FIXED_DT_SECONDS * invM;
-    const nx = px + vx * FIXED_DT_SECONDS;
-    const ny = py + vy * FIXED_DT_SECONDS;
+    // Velocity Verlet: matches main-game.js integrateVerlet().
+    const field0 = computeGravityField(bodies, [px, py]);
+    const ax0 = field0[0] * G * invM;
+    const ay0 = field0[1] * G * invM;
+
+    const nx = px + vx * dt + 0.5 * ax0 * dt * dt;
+    const ny = py + vy * dt + 0.5 * ay0 * dt * dt;
+
+    const field1 = computeGravityField(bodies, [nx, ny]);
+    const ax1 = field1[0] * G * invM;
+    const ay1 = field1[1] * G * invM;
+
+    vx += 0.5 * (ax0 + ax1) * dt;
+    vy += 0.5 * (ay0 + ay1) * dt;
 
     // Arc length bookkeeping.
     const dx = nx - px;

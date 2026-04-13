@@ -44,7 +44,7 @@ To keep scope focused, v2 does **not** touch the following (and any change there
 
 - The core gravity formula (`F ∝ m / r²` per body, summed, multiplied by `G = −10000`).
 - The bounding-circle collision model (ball-radius + other-radius).
-- The Euler integrator (`v += F·dt/m`, `x += v·dt`) — only `dt` changes (and that's automatic from the new timestep).
+- ~~The Euler integrator — replaced by Velocity Verlet in §2.4.~~
 - The 11-cell candidate grid and ±25 px jitter used for planet/hole placement (though the *count* scales with difficulty — see §11).
 - The ball's fixed starting position at `(50, 50)` and its effective mass of 1.
 - The `800 × 600` **world** coordinate space. The canvas now fills the viewport and a dynamic camera controls what's visible (§3), but all physics, collision, and level-generation math still operates in the 800 × 600 world.
@@ -88,9 +88,31 @@ V1 drives the whole game from a `setInterval(tick, 1000/30)` loop. Each tick bot
 
 ### 2.3 Notes on the dt change
 
-Halving `dt` (33.3 ms → 16.7 ms) reduces Euler integration error, particularly near planets where the field is steep. Expect close-orbit trajectories to feel slightly more predictable. Launch power and overall feel should be indistinguishable to the player.
+Halving `dt` (33.3 ms → 16.7 ms) reduces integration error, particularly near planets where the field is steep. Expect close-orbit trajectories to feel slightly more predictable. Launch power and overall feel should be indistinguishable to the player.
 
 **Tunable**: `FIXED_DT_MS` in `js/config.js`. Changing it re-tunes the whole simulation, so shouldn't be touched casually.
+
+### 2.4 Velocity Verlet integrator
+
+V1 and the initial v2 implementation used **symplectic Euler** (`v += a·dt`, then `x += v·dt`). Debug-overlay energy tracking (§15.4) revealed ±2.5% energy oscillations during close planetary flybys — the first-order error term `O(dt)` is significant when the gravitational field changes rapidly within a single timestep.
+
+V2 now uses **Velocity Verlet** (Störmer–Verlet), a second-order symplectic integrator with energy error `O(dt²)`:
+
+```
+a₀ = G · field(x_n) / m
+x_{n+1} = x_n + v_n·dt + ½·a₀·dt²
+a₁ = G · field(x_{n+1}) / m
+v_{n+1} = v_n + ½·(a₀ + a₁)·dt
+```
+
+**Why Velocity Verlet:**
+
+- **Symplectic** — conserves a modified Hamiltonian, so energy oscillates near the true value without secular drift (same qualitative property as Euler, but with much smaller oscillations).
+- **Second-order** — the error per step is `O(dt³)` and the global error is `O(dt²)`, vs `O(dt²)` and `O(dt)` for symplectic Euler. At 60 Hz this reduces close-flyby energy oscillations from ~2.5% to negligible levels.
+- **Same cost structure** — two gravity evaluations per step instead of one, but each evaluation is cheap (3–6 planets). No additional state to store between frames.
+- **Preview consistency** — the aim preview (§5) uses the same Velocity Verlet step, so the dashed trajectory line matches actual flight exactly.
+
+**Implementation:** `integrateVerlet(ball, bodies, dt)` in `main-game.js`, called once per physics tick in `updateSimulation`. The aim preview in `aim-preview.js` uses an inline equivalent with local variables.
 
 ---
 
@@ -162,9 +184,11 @@ where `scaleFactor` accounts for the canvas resolution relative to the 800×600 
 6.   Draw the ball.
 7.   Draw aim line + aim preview (aiming only).
 8.   Draw off-screen indicators (simulation only, if ball is outside visible area).
-9. ctx.restore();
-10. Draw HUD (screen space — fixed to canvas edges).
-11. Draw confirm-exit overlay (screen space, if active).
+9.   Draw debug world overlays: ball trail, CoG marker (§15, if active).
+10. ctx.restore();
+11. Draw HUD (screen space — fixed to canvas edges).
+12. Draw debug HUD: energy readout, DEBUG label, debug panel (§15, if active).
+13. Draw confirm-exit overlay (screen space, if active).
 ```
 
 The HUD, menus, and overlays are always in screen space and unaffected by camera zoom/pan.
@@ -242,9 +266,8 @@ Gravity from multiple bodies is hard to intuit, especially on a first playthroug
 - **Computed in the `aiming` sub-state every render**, not every physics tick — the preview is a rendering overlay, not a simulation state.
 - **Forward integration**:
   1. Take a shadow copy of the ball (position, velocity computed as if firing now).
-  2. Apply `applyForce` with the current `computeGravityField` on the live planets.
-  3. Step forward at the same `FIXED_DT_SECONDS` used by physics — this guarantees the preview matches what will actually happen.
-  4. Record `[x, y]` after each step.
+  2. Step forward using the same Velocity Verlet integrator (§2.4) and `FIXED_DT_SECONDS` used by the real physics — this guarantees the preview matches what will actually happen.
+  3. Record `[x, y]` after each step.
 - **Stop conditions** (whichever fires first):
   - `PREVIEW_MAX_ARC_LENGTH` total arc length reached. Default **300 design pixels** (the same scale the user specified).
   - `PREVIEW_MAX_STEPS` physics steps simulated. Default **60 steps** (~1 second of real time at 60 Hz) as a belt-and-suspenders cap so a near-zero launch speed doesn't create an infinite loop inside one frame.
@@ -337,7 +360,7 @@ In practice the dynamic camera means the player almost never sees these indicato
 
 ### 8.1 Elements
 
-Three pieces of text, monospace, drawn on top of the game canvas in screen space (after the camera `ctx.restore()`, so they're unaffected by zoom/pan — see §3.5 step 10):
+Three pieces of text, monospace, drawn on top of the game canvas in screen space (after the camera `ctx.restore()`, so they're unaffected by zoom/pan — see §3.5 step 11):
 
 - **LIVES** — top-left. Rendered as `♥ ♥ ♥` (or fallback `* * *`) with lost lives dimmed. Alternative: plain text `Lives: 3`.
 - **STREAK** — top-center. `STREAK 7` means the player has won 7 consecutive levels in the current run.
@@ -657,15 +680,175 @@ class ScreenGameState extends GameState {
 
 ---
 
-## 15. Files touched or added
+## 15. Debug overlay
+
+### 15.1 Motivation
+
+During playtesting, the ball occasionally appears to take trajectories that are longer than expected — seemingly gaining energy over time. It is unclear whether this is a perceptual artifact of the dynamic camera's zoom-out (which visually linearizes exponential-looking behavior) or an actual integration error in the symplectic Euler integrator, which can produce transient energy spikes during close planetary encounters where `G = −10000` and `dt = 1/60` create steep force gradients within a single timestep.
+
+A debug overlay provides direct instrumentation: real-time energy monitoring settles the question definitively, a center-of-gravity marker gives spatial intuition about the gravitational landscape, and a ball trail reveals the actual trajectory the ball followed — making it possible to distinguish "the zoom made it look wrong" from "the physics is wrong."
+
+### 15.2 Activation
+
+The debug overlay is gated on a **URL query parameter**. If `?debug` is present in the URL (e.g. `index-ng.html?debug`), the overlay system activates. It is completely inert otherwise — no per-frame cost, no DOM changes, no code paths touched. Checked once at boot via `URLSearchParams`.
+
+The `?debug` parameter is orthogonal to the `#seed=...&streak=...` hash parameters (§14). Both can be present simultaneously: `index-ng.html?debug#seed=42&streak=5`.
+
+### 15.3 "DEBUG" label and panel toggle
+
+When active, a small **`DEBUG`** label is drawn in the **bottom-left** corner of the canvas in screen space (same layer as the HUD — step 12 in §3.5). The label is always visible while `?debug` is set.
+
+- Font: system monospace, 12 px, same family as the HUD.
+- Color: `rgba(255, 255, 255, 0.6)` — present but unobtrusive.
+- Position: 12 px from the bottom-left canvas edge.
+
+Clicking the label toggles a **debug panel** that shows diagnostic information and feature toggles. The panel is drawn in screen space, anchored to the bottom-left, above the label.
+
+### 15.4 Energy readout
+
+The panel displays the ball's total mechanical energy during the `simulation` sub-state:
+
+```
+ E₀:    25,041
+ KE:   125,432
+ PE:  -118,201
+ E:      7,231
+ ΔE:     +0.3%
+```
+
+**Definitions:**
+
+- **E₀** — launch energy, captured once at the moment the ball enters simulation. Displayed so the user can see the reference value ΔE is computed against.
+- **KE** — kinetic energy: `0.5 × (vx² + vy²)`. Ball mass is 1 (§1.1), so this simplifies to half the squared speed.
+- **PE** — gravitational potential energy: `Σ(G × planet_mass_i / distance_i)`. With `G = −10000`, PE is large and negative near planets, approaching zero as the ball flies far away.
+- **E** — total mechanical energy: `KE + PE`.
+- **ΔE** — percentage drift from launch: `(E_current − E_launch) / |E_launch| × 100`.
+
+**ΔE is the key diagnostic.** In a perfect integrator, ΔE = 0 at all times. The Velocity Verlet integrator (§2.4) conserves a *modified* Hamiltonian with `O(dt²)` error, so ΔE should remain very small (fractions of a percent) without systematic drift. The previous symplectic Euler integrator showed ±2.5% oscillations during close planetary flybys; Velocity Verlet reduces this to negligible levels.
+
+**Energy formula derivation:** The code computes `field = Σ(dir × m_planet / d²)` then the integrator applies it as acceleration `a = field × G / ball.mass`. With `ball.mass = 1`, the effective equation of motion is `dv/dt = G × Σ(m_i / d_i² × dir_i)`, which derives from the potential `V = G × Σ(m_i / d_i)`. The conserved quantity is therefore `E = 0.5 × |v|² + Σ(G × m_i / d_i)`.
+
+**Capture timing:** `E_launch` is recorded once, on the first physics tick after the ball transitions from `aiming` to `simulation` (i.e., after the initial velocity has been set and the first force applied). During `aiming`, the panel shows `E: (aiming)` instead of numbers.
+
+### 15.5 Center-of-gravity marker
+
+A small crosshair drawn at the **mass-weighted centroid of all planets** (not including the ball):
+
+```
+CoG = Σ(mass_i × position_i) / Σ(mass_i)
+```
+
+This is the same centroid used in the escape-velocity computation (§6), now made visible.
+
+- Drawn in **world space** (inside the camera transform, step 9 in §3.5).
+- Shape: a `+` crosshair, **8 screen-pixels across** regardless of zoom. To achieve constant screen size inside the camera transform, the arm length is `4 / (zoom × scaleFactor)` world units.
+- Color: dim cyan (`rgba(0, 200, 200, 0.5)`), distinct from all game objects.
+- Static for the duration of a level (planets don't move). Computed once on level start; not recomputed per frame.
+- Visible whenever the debug panel is open, in both `aiming` and `simulation` sub-states.
+
+### 15.6 Equipotential field contours
+
+When enabled via the `[x] Field` toggle in the debug panel, the game draws **equipotential contour lines** over the playing field — a topographic map of the gravitational landscape. These are computed once per level (planets are static) using marching squares on a sampled grid.
+
+**What the contours show:**
+
+- **Gravity wells** — concentric contours around each planet; deeper wells have more tightly packed lines.
+- **Field strength** — line density directly encodes gradient magnitude. Tightly spaced = strong pull, widely spaced = weak field.
+- **Saddle points** — regions between planets where forces partially cancel. The contours pinch into figure-eights, revealing corridors the ball can thread through.
+- **Escape paths** — widely spaced outer contours show where the ball is essentially free of gravitational influence.
+
+**Computation (one-time per level):**
+
+1. Sample the gravitational potential `V(x,y) = G × Σ(m_i / max(d_i, r_i))` on a grid with `DEBUG_CONTOUR_GRID_RES` spacing (default 10 world pixels), extending 200 px beyond screen bounds.
+2. Choose `DEBUG_CONTOUR_LEVELS` (default 16) linearly spaced iso-values between the 10th and 90th percentile of the sampled values. Percentile clipping avoids wasting contour levels on extreme values inside planet surfaces.
+3. Run marching squares over the grid for each iso-value, with bilinear saddle-point disambiguation, producing a flat array of line segments.
+
+**Rendering:**
+
+- All segments drawn in a single `beginPath / stroke` call with `rgba(0, 200, 200, 0.3)` — semi-transparent cyan matching the CoG crosshair.
+- Line width is `1 × invScale` (constant 1 CSS pixel regardless of camera zoom).
+- Drawn first in the world-space debug pass (before CoG and trail) so it sits behind other overlays.
+
+### 15.7 Ball trail
+
+When enabled via a toggle in the debug panel, the game records the ball's position during `simulation` and draws a dot trail showing the path it followed. The purpose is to make the actual trajectory legible independent of camera zoom — revealing curvature that the zoom-out might perceptually flatten.
+
+**Sampling:**
+
+- One sample every **6 physics ticks** (60 Hz / 6 = **10 samples per second**).
+- Stored in a **circular buffer** of **3000 entries** (~5 minutes of flight at 10 Hz).
+- Each entry is an `[x, y]` pair in world coordinates.
+- The buffer is cleared on level start and on each new shot (return to `aiming`).
+- Sampling counter and buffer state live in `debug.js`, not in game state.
+
+**Rendering:**
+
+- Each sample is drawn as a small filled circle in **world space** (inside the camera transform, step 9 in §3.5, alongside the CoG marker).
+- Dot radius: **3 screen pixels**, constant regardless of zoom. Achieved by drawing at radius `3 / (zoom × scaleFactor)` world units.
+- Color: white at 0.5 alpha (`rgba(255, 255, 255, 0.5)`). No fade by age — all dots are equal.
+- Canvas clipping handles off-screen dots automatically (`arc()` calls for points outside the viewport are effectively free), so no manual culling is needed.
+- The trail does **not** affect the camera's bounding-box computation (§3.3). The camera tracks game objects only — the trail is a passive overlay. This means the camera may zoom in past distant trail dots, which simply scroll off-screen — exactly the desired behavior for observing how the trajectory looks at different zoom levels.
+
+**Performance:** 3000 `arc()` calls per frame is trivial for canvas 2D. No pre-rendering, batching, or off-screen canvas needed.
+
+### 15.8 Trajectory logging and export
+
+When enabled via the `[x] Log` toggle in the debug panel, the module records per-sample physics state during `simulation` at the same rate as the trail (10 Hz). Each entry captures: physics tick, position `[x, y]`, velocity `[vx, vy]`, and energy breakdown (KE, PE, E).
+
+An **`> Export (N pts)`** button appears in the panel when logging is enabled. Clicking it copies a text report to the clipboard (or logs to console as fallback) containing:
+
+1. **Level header** — launch point, hole position/radius, `G`, `dt`, and a table of planet positions/masses/radii. Captured on level start so the full simulation setup is reproducible.
+2. **Launch energy** — `E_launch` value.
+3. **Trajectory table** — tab-separated columns: `tick, x, y, vx, vy, KE, PE, E`.
+
+The exported text is designed to be pasted directly for offline analysis — e.g. plotting energy drift over time or comparing trajectories against an independent integrator.
+
+The log buffer is a plain JS array (not a typed circular buffer like the trail) since it's only read on export. It is cleared on each new shot.
+
+### 15.9 Debug click handling
+
+The debug label and panel consume pointer events in screen space. Click priority:
+
+1. If the debug panel is open and the click hits a toggle or button (trail, log, export), consume the click.
+2. If the click hits the "DEBUG" label, toggle the panel and consume the click.
+3. Otherwise, fall through to normal game input handling (forfeit, mute, etc.).
+
+This prevents accidental forfeits or launches when interacting with debug controls.
+
+### 15.10 Module
+
+New file: `js/ng/debug.js`. Self-contained module exporting:
+
+- `debugInit()` — check `URLSearchParams` for `debug`. Called once at boot from `cloze-call.js`.
+- `debugIsEnabled()` — returns `true` if `?debug` was present. All debug code paths gate on this.
+- `debugOnLevelStart(bodies, ball, hole)` — clear trail buffer + trajectory log, precompute CoG, capture level info (planet positions/masses/radii, hole, launch point) for export header.
+- `debugOnSimulationStart(ball, bodies)` — capture `E_launch`, clear trail + log for new shot.
+- `debugOnPhysicsTick(ball, bodies)` — sample trail point and trajectory log entry every `DEBUG_TRAIL_SAMPLE_INTERVAL` ticks.
+- `debugRenderWorld(ctx, cam, canvasW, canvasH)` — draw trail dots + CoG marker in world space.
+- `debugRenderHud(ctx, ball, bodies, canvasW, canvasH)` — draw "DEBUG" label + overlay panel (E₀, KE, PE, E, ΔE, trail toggle, log toggle, export button) in screen space.
+- `debugHandleClick(screenX, screenY)` — hit-test label, panel toggles, and export button; returns `true` if consumed.
+
+### 15.11 Tunables
+
+All constants live in `config.js` alongside other tunables, but are only read when debug mode is active:
+
+- `DEBUG_TRAIL_SAMPLE_INTERVAL` — physics ticks between trail samples (default **6**, giving 10 Hz).
+- `DEBUG_TRAIL_MAX_POINTS` — circular buffer capacity (default **3000**, ~5 minutes at 10 Hz).
+- `DEBUG_TRAIL_DOT_RADIUS_PX` — screen-pixel radius of trail dots (default **3**).
+- `DEBUG_CONTOUR_GRID_RES` — world-pixel cell size for the potential sampling grid (default **10**).
+- `DEBUG_CONTOUR_LEVELS` — number of equipotential contour lines (default **16**).
+
+---
+
+## 16. Files touched or added
 
 **Parallel tree**, not in-place edits. V1 at `index.html` / `css/style.css` / `js/*.js` is frozen. V2 lives under `index-ng.html` / `css/ng/` / `js/ng/` and references the shared `data/gfx/` folder.
 
-### 15.1 New files (copied from v1 and then modified as noted)
+### 16.1 New files (copied from v1 and then modified as noted)
 
 - `index-ng.html` — V2 entry point. Minimal HTML with a responsive wrapper, canvas, mute button, and `<script type="module" src="js/ng/cloze-call.js">`.
 - `css/ng/style.css` — viewport-filling canvas (no aspect-ratio constraint), `touch-action: none`.
-- `js/ng/config.js` — updated constants. `FIXED_DT_MS = 1000/60`, `LAUNCH_SPEED_CAP = 400`, new `PREVIEW_MAX_ARC_LENGTH`, `PREVIEW_MAX_STEPS`, `FADE_IN_DURATION`, `FADE_OUT_DURATION`, `SCREEN_MIN_DISPLAY_TIME`, `DIFFICULTY` block. `LAUNCH_SPEED_CAP_AT_INDICATOR_MAX` flag is gone (answered: drop).
+- `js/ng/config.js` — updated constants. `FIXED_DT_MS = 1000/60`, `LAUNCH_SPEED_CAP = 400`, new `PREVIEW_MAX_ARC_LENGTH`, `PREVIEW_MAX_STEPS`, `FADE_IN_DURATION`, `FADE_OUT_DURATION`, `SCREEN_MIN_DISPLAY_TIME`, `DIFFICULTY` block, `DEBUG_TRAIL_*` constants (§15.9). `LAUNCH_SPEED_CAP_AT_INDICATOR_MAX` flag is gone (answered: drop).
 - `js/ng/math.js` — unchanged from v1.
 - `js/ng/gsm.js` — unchanged from v1.
 - `js/ng/pictures.js` — unchanged from v1.
@@ -681,10 +864,11 @@ class ScreenGameState extends GameState {
 - `js/ng/hud.js` — new. HUD rendering (lives / streak / best + mute icon click-target).
 - `js/ng/main-menu-state.js` — new. `MainMenuState`, `HowToPlayState`, `AboutState`, `ConfirmExitState` co-located.
 - `js/ng/camera.js` — new. Dynamic camera: center, zoom, lerp, bounding-box fit, inverse transform for input coordinates (§3.3).
-- `js/ng/main-game.js` — 60 Hz tuned, mass-weighted centroid fix, aim-preview, edge-arrow + arc, HUD integration, audio hooks, ESC → confirm dialog, victory → explicit NEXT button, no `LAUNCH_SPEED_CAP_AT_INDICATOR_MAX` flag (always capped). Camera integration: world-space rendering inside camera transform, screen-space HUD outside. Shot forfeit (§9.5).
-- `js/ng/cloze-call.js` — main loop = `requestAnimationFrame` + accumulator (60 Hz physics). Registers `main-menu` as the initial state. Parses `#seed=...&streak=...` on boot. Wires `AudioContext` to the first `pointerdown`. `test-state` is *not* registered (answered: strip). Dynamic canvas resize handler.
+- `js/ng/debug.js` — new. Debug overlay module: URL-gated activation (`?debug`), energy readout (KE/PE/E/ΔE), center-of-gravity crosshair, togglable ball trail with circular sample buffer. Self-contained; all debug code paths gate on `debugIsEnabled()` (§15).
+- `js/ng/main-game.js` — 60 Hz tuned, mass-weighted centroid fix, aim-preview, edge-arrow + arc, HUD integration, audio hooks, ESC → confirm dialog, victory → explicit NEXT button, no `LAUNCH_SPEED_CAP_AT_INDICATOR_MAX` flag (always capped). Camera integration: world-space rendering inside camera transform, screen-space HUD outside. Shot forfeit (§9.5). Debug overlay hooks: trail sampling in `updateSimulation`, world-space + screen-space debug rendering in `render` (§15).
+- `js/ng/cloze-call.js` — main loop = `requestAnimationFrame` + accumulator (60 Hz physics). Registers `main-menu` as the initial state. Parses `#seed=...&streak=...` on boot. Calls `debugInit()` to check for `?debug` URL parameter (§15.2). Wires `AudioContext` to the first `pointerdown`. `test-state` is *not* registered (answered: strip). Dynamic canvas resize handler.
 
-### 15.2 Shared / unchanged
+### 16.2 Shared / unchanged
 
 - `data/gfx/*` — shared with v1. `marker.png` finally gets drawn (§7). `lisp.png` is not referenced by the v2 port at all.
 - All of `index.html`, `css/style.css`, `js/*.js` — the v1 port remains untouched and playable.
@@ -693,13 +877,13 @@ class ScreenGameState extends GameState {
 
 ---
 
-## 16. Port decisions (V2)
+## 17. Port decisions (V2)
 
 This table summarizes all v2 decisions, mirroring the one in v1 `design.md §4`.
 
 | Area                    | V2 decision                                                                                          | Reference |
 |-------------------------|------------------------------------------------------------------------------------------------------|-----------|
-| Physics timestep        | Fixed 60 Hz (was 30 Hz in v1)                                                                         | §2        |
+| Physics timestep        | Fixed 60 Hz (was 30 Hz in v1), Velocity Verlet integrator (was symplectic Euler)                       | §2, §2.4  |
 | Render loop             | `requestAnimationFrame` with accumulator; pauses with tab                                             | §2        |
 | Viewport                | Viewport-filling canvas, no letterbox; dynamic camera zooms to keep ball visible                       | §3        |
 | Input                   | Pointer Events (mouse + touch + pen), keyboard for screen-skip and ESC                                 | §4        |
@@ -721,11 +905,12 @@ This table summarizes all v2 decisions, mirroring the one in v1 `design.md §4`.
 | Dynamic camera          | World-space rendering with zoom-out during simulation; screen-space HUD and background                | §3.3      |
 | Shot forfeit            | Tap/Space/R during simulation (after 0.5 s grace) to abort and lose a life                            | §9.5      |
 | Level retry             | RETRY button on defeat screen re-seeds PRNG for same level; streak resets                             | §9.4      |
-| Out of scope for v2     | Leaderboards, daily challenges, shot/time per-level scoring, HiDPI canvas scaling, achievements       | §17       |
+| Debug overlay           | URL-gated `?debug` with energy readout, CoG marker, togglable ball trail; zero cost when inactive     | §15       |
+| Out of scope for v2     | Leaderboards, daily challenges, shot/time per-level scoring, HiDPI canvas scaling, achievements       | §18       |
 
 ---
 
-## 17. Non-goals / deferred to V3
+## 18. Non-goals / deferred to V3
 
 Things deliberately NOT in v2, to keep scope bounded:
 
@@ -742,9 +927,9 @@ Things deliberately NOT in v2, to keep scope bounded:
 
 ---
 
-## 18. Implementation order (suggested)
+## 19. Implementation order (suggested)
 
-Steps 1–12 are the original v2 build order (all completed). Steps 13–19 are post-playtesting additions driven by player feedback.
+Steps 1–12 are the original v2 build order (all completed). Steps 13–19 are post-playtesting additions driven by player feedback. Step 20 adds debug instrumentation.
 
 **Original v2 (completed):**
 
@@ -771,9 +956,13 @@ Steps 1–12 are the original v2 build order (all completed). Steps 13–19 are 
 18. **Level retry** — `session.js` records last-level seed/streak; RETRY button on `DefeatedState`.
 19. **Polish pass**: tune camera lerp speed, zoom limits, forfeit grace period, test on mobile portrait/landscape.
 
+**Debug instrumentation (§15):**
+
+20. **Debug overlay module** (`debug.js`) — URL-gated `?debug` activation, energy readout (KE/PE/E/ΔE), CoG crosshair marker, togglable ball trail with circular sample buffer. Integrate into `main-game.js` render pipeline (world-space overlays inside camera transform, screen-space panel after HUD). Wire `debugInit()` into `cloze-call.js` boot sequence.
+
 ---
 
-## 19. Resolved answers (pre-implementation)
+## 20. Resolved answers (pre-implementation)
 
 All ten open questions have been answered. Captured here for traceability; wherever a decision changes earlier sections of this document, the relevant section has been updated in place as well.
 
@@ -790,6 +979,6 @@ All ten open questions have been answered. Captured here for traceability; where
 | 9 | `lisp.png` + empty `test-state`                                     | **Strip** both from v2                                          |
 | 10| Keep `LAUNCH_SPEED_CAP_AT_INDICATOR_MAX` flag                       | **Drop** — v2 cap is unconditional                              |
 
-Implementation can proceed per §18.
+Implementation can proceed per §19.
 
-Answer these and I'll start on step 1 from §18.
+Answer these and I'll start on step 1 from §19.

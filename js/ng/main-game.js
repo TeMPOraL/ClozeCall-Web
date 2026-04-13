@@ -44,6 +44,10 @@ import {
   cameraUpdate, cameraApplyTransform, cameraInverseTransform,
   cameraVisibleRect,
 } from './camera.js';
+import {
+  debugIsEnabled, debugOnLevelStart, debugOnSimulationStart,
+  debugOnPhysicsTick, debugRenderWorld, debugRenderHud, debugHandleClick,
+} from './debug.js';
 
 // Color endpoints for the aim line lerp.
 const GREEN = { r: 0,   g: 255, b: 0 };
@@ -56,22 +60,47 @@ const lerpColor = (a, b, t) => ({
 
 // ---- Physics helpers ----
 
-const applyForce = (ball, force, dt) => {
-  const accel = scaledVec(force, dt / ball.mass);
-  ball.velocity = addVecs(ball.velocity, accel);
-  ball.position = addVecs(ball.position, scaledVec(ball.velocity, dt));
-};
-
-const computeGravityField = (bodies, ball) => {
+/** Gravitational field at `position`: Σ (m_i / d_i²) · dir_i (points away from planets). */
+const computeGravityField = (bodies, position) => {
   let total = makeVec(0, 0);
   for (const body of bodies) {
-    const d = distance(ball.position, body.position);
+    const d = distance(position, body.position);
     if (d === 0) continue;
-    const delta = subVecs(ball.position, body.position);
+    const delta = subVecs(position, body.position);
     const dir = normalizedVec(delta);
     total = addVecs(total, scaledVec(dir, body.mass / square(d)));
   }
   return total;
+};
+
+/**
+ * Velocity Verlet integration step (design-v2.md §2.4).
+ *
+ * Second-order symplectic integrator. Energy error is O(dt²) vs O(dt) for the
+ * first-order symplectic Euler this replaces. Two gravity evaluations per step
+ * (current + new position) keeps close planetary flybys accurate.
+ *
+ *   a₀ = G · field(x_n) / m
+ *   x_{n+1} = x_n + v_n·dt + ½·a₀·dt²
+ *   a₁ = G · field(x_{n+1}) / m
+ *   v_{n+1} = v_n + ½·(a₀ + a₁)·dt
+ */
+const integrateVerlet = (ball, bodies, dt) => {
+  const field0 = computeGravityField(bodies, ball.position);
+  const a0 = scaledVec(field0, G / ball.mass);
+
+  ball.position = addVecs(
+    addVecs(ball.position, scaledVec(ball.velocity, dt)),
+    scaledVec(a0, 0.5 * dt * dt),
+  );
+
+  const field1 = computeGravityField(bodies, ball.position);
+  const a1 = scaledVec(field1, G / ball.mass);
+
+  ball.velocity = addVecs(
+    ball.velocity,
+    scaledVec(addVecs(a0, a1), 0.5 * dt),
+  );
 };
 
 const collisionBetweenObjects = (a, b) =>
@@ -173,6 +202,8 @@ export class MainGameState extends GameState {
     );
 
     resetPointerState();
+
+    if (debugIsEnabled()) debugOnLevelStart(this.celestialBodies, this.ball, this.hole);
   }
 
   reinitializeGame() {
@@ -181,6 +212,8 @@ export class MainGameState extends GameState {
     this.simTime = 0;
     cameraResetToAiming(this.cam);
     resetPointerState();
+
+    if (debugIsEnabled()) debugOnLevelStart(this.celestialBodies, this.ball, this.hole);
   }
 
   updateLogic(gsm, dt) {
@@ -227,15 +260,21 @@ export class MainGameState extends GameState {
     // 8. Off-screen indicators (simulation only).
     if (this.state === 'simulation') this.renderSimulation(ctx, cw, ch);
 
-    // 9. End camera transform.
+    // 9. Debug world overlays (trail, CoG marker — design-v2.md §15).
+    debugRenderWorld(ctx, this.cam, cw, ch);
+
+    // 10. End camera transform.
     ctx.restore();
 
-    // 10. HUD (screen space).
+    // 11. HUD (screen space).
     renderHud(ctx, {
       lives:  session.getLives(),
       streak: session.getStreak(),
       best:   session.getBest(),
     });
+
+    // 12. Debug HUD (energy readout, panel — design-v2.md §15).
+    debugRenderHud(ctx, this.ball, this.celestialBodies, cw, ch);
 
     // Forfeit hint (screen space, design-v2.md §9.5).
     if (this.state === 'simulation' && this.simTime >= FORFEIT_HINT_DELAY_SECONDS) {
@@ -246,7 +285,7 @@ export class MainGameState extends GameState {
       ctx.fillText('tap to forfeit shot', cw / 2, ch - 14);
     }
 
-    // 11. Confirm overlay (screen space).
+    // 13. Confirm overlay (screen space).
     if (this.state === 'confirm-exit') this.renderConfirmExit(ctx);
   }
 
@@ -254,6 +293,9 @@ export class MainGameState extends GameState {
   updateAiming(gsm, _dt) {
     const release = consumePointerReleased();
     if (!release) return;
+
+    // Debug overlay click (highest priority after pointer release).
+    if (debugIsEnabled() && debugHandleClick(release.raw[0], release.raw[1])) return;
 
     // HUD mute button: hit-test in canvas-pixel coords.
     if (hudMuteContains(release.raw[0], release.raw[1], gsm.canvas.width)) {
@@ -267,6 +309,8 @@ export class MainGameState extends GameState {
     this.state = 'simulation';
     this.resumeSub = 'simulation';
     this.simTime = 0;
+
+    if (debugIsEnabled()) debugOnSimulationStart(this.ball, this.celestialBodies);
   }
 
   renderAiming(ctx) {
@@ -298,18 +342,21 @@ export class MainGameState extends GameState {
   updateSimulation(gsm, dt) {
     this.simTime += dt;
 
-    const field = computeGravityField(this.celestialBodies, this.ball);
-    applyForce(this.ball, scaledVec(field, G), dt);
+    integrateVerlet(this.ball, this.celestialBodies, dt);
+
+    if (debugIsEnabled()) debugOnPhysicsTick(this.ball, this.celestialBodies);
 
     // Camera: track all objects during simulation.
     cameraUpdateTarget(this.cam, this.ball, this.celestialBodies, this.hole,
       gsm.canvas.width, gsm.canvas.height);
     cameraUpdate(this.cam);
 
-    // Pointer tap: mute button or forfeit (after grace period).
+    // Pointer tap: debug overlay, mute button, or forfeit (after grace period).
     const release = consumePointerReleased();
     if (release) {
-      if (hudMuteContains(release.raw[0], release.raw[1], gsm.canvas.width)) {
+      if (debugIsEnabled() && debugHandleClick(release.raw[0], release.raw[1])) {
+        // consumed by debug panel
+      } else if (hudMuteContains(release.raw[0], release.raw[1], gsm.canvas.width)) {
         audio.toggleMute();
         audio.sfxMenuClick();
       } else if (this.simTime >= FORFEIT_GRACE_SECONDS) {
